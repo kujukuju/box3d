@@ -335,6 +335,39 @@ typedef struct b3ContinuousContext
 	int rootIterations;
 } b3ContinuousContext;
 
+typedef struct b3ContinuousPreSolveContext
+{
+	b3ContinuousContext* continuousContext;
+	b3Shape* shapeA;
+	b3Shape* shapeB;
+} b3ContinuousPreSolveContext;
+
+static bool b3ContinuousPreSolveCandidate( const b3TOIOutput* output, int childIndex, int triangleIndex, void* context )
+{
+	b3ContinuousPreSolveContext* preSolveContext = context;
+	b3ContinuousContext* continuousContext = preSolveContext->continuousContext;
+	b3World* world = continuousContext->world;
+	B3_ASSERT( world->preSolveFcn != NULL );
+
+	b3Shape* shapeA = preSolveContext->shapeA;
+	b3Shape* shapeB = preSolveContext->shapeB;
+	b3ShapeId shapeIdA = { shapeA->id + 1, world->worldId, shapeA->generation };
+	b3ShapeId shapeIdB = { shapeB->id + 1, world->worldId, shapeB->generation };
+	b3PreSolveData data = {
+		.phase = b3_preSolveContinuous,
+		.childIndexA = childIndex,
+		.childIndexB = B3_NULL_INDEX,
+		.point = b3OffsetPos( continuousContext->base, output->point ),
+		.normal = output->normal,
+		.fraction = output->fraction,
+		.triangleIndexA = triangleIndex,
+		.triangleIndexB = B3_NULL_INDEX,
+	};
+
+	// Continuous collision has no solver manifold. The callback can only reject this candidate.
+	return world->preSolveFcn( shapeIdA, shapeIdB, &data, world->preSolveContext );
+}
+
 // This is called from b3DynamicTree_Query for continuous collision
 static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* context )
 {
@@ -418,8 +451,19 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 	// todo does having a sweep on shapeA help with bullets?
 	b3Sweep sweepA = b3MakeRelativeSweep( bodySim, continuousContext->base );
 
-	// Time of impact versus shape. Supports all shape types
-	b3TOIOutput output = b3ShapeTimeOfImpact( shape, fastShape, &sweepA, &continuousContext->sweep, continuousContext->fraction );
+	// Time of impact versus shape. Supports all shape types.
+	b3TOICandidateFcn* candidateFcn = NULL;
+	b3ContinuousPreSolveContext preSolveContext = { 0 };
+	if ( isSensor == false && world->preSolveFcn != NULL &&
+		 ( ( shape->flags & b3_enablePreSolveEvents ) || ( fastShape->flags & b3_enablePreSolveEvents ) ) )
+	{
+		preSolveContext.continuousContext = continuousContext;
+		preSolveContext.shapeA = shape;
+		preSolveContext.shapeB = fastShape;
+		candidateFcn = b3ContinuousPreSolveCandidate;
+	}
+	b3TOIOutput output = b3ShapeTimeOfImpact( shape, fastShape, &sweepA, &continuousContext->sweep, continuousContext->fraction,
+											  candidateFcn, &preSolveContext );
 	if ( isSensor )
 	{
 		// Only accept a sensor hit that is sooner than the current solid hit.
@@ -440,24 +484,11 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 	}
 	else if ( 0.0f < output.fraction && output.fraction < continuousContext->fraction )
 	{
-		bool didHit = true;
-
-		if ( didHit && ( ( shape->flags & b3_enablePreSolveEvents ) || ( fastShape->flags & b3_enablePreSolveEvents ) ) )
-		{
-			b3ShapeId shapeIdA = { shape->id + 1, world->worldId, shape->generation };
-			b3ShapeId shapeIdB = { fastShape->id + 1, world->worldId, fastShape->generation };
-			b3Pos point = b3OffsetPos( continuousContext->base, output.point );
-			didHit = world->preSolveFcn( shapeIdA, shapeIdB, point, output.normal, world->preSolveContext );
-		}
-
-		if ( didHit )
-		{
-			fastBodySim->flags |= b3_hadTimeOfImpact;
-			continuousContext->fraction = output.fraction;
-			continuousContext->distanceIterations = b3MaxInt( continuousContext->distanceIterations, output.distanceIterations );
-			continuousContext->pushBackIterations = b3MaxInt( continuousContext->pushBackIterations, output.pushBackIterations );
-			continuousContext->rootIterations = b3MaxInt( continuousContext->rootIterations, output.rootIterations );
-		}
+		fastBodySim->flags |= b3_hadTimeOfImpact;
+		continuousContext->fraction = output.fraction;
+		continuousContext->distanceIterations = b3MaxInt( continuousContext->distanceIterations, output.distanceIterations );
+		continuousContext->pushBackIterations = b3MaxInt( continuousContext->pushBackIterations, output.pushBackIterations );
+		continuousContext->rootIterations = b3MaxInt( continuousContext->rootIterations, output.rootIterations );
 	}
 
 	float ms = b3GetMilliseconds( ticks );

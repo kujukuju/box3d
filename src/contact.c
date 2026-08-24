@@ -15,6 +15,9 @@
 
 #include "box3d/box3d.h"
 
+#include <float.h>
+#include <string.h>
+
 // Contacts and determinism
 // A deterministic simulation requires contacts to exist in the same order in b3Island no matter the thread count.
 // The order must reproduce from run to run. This is necessary because the Gauss-Seidel constraint solver is order dependent.
@@ -57,6 +60,26 @@ static b3Contact* b3GetContactFullId( b3World* world, b3ContactId contactId )
 	b3Contact* contact = b3Array_Get( world->contacts, id );
 	B3_ASSERT( contact->contactId == id && contact->generation == contactId.generation );
 	return contact;
+}
+
+b3Pos b3PreSolve_GetPoint( const b3PreSolveData* data, int manifoldIndex, int pointIndex )
+{
+	B3_ASSERT( data != NULL && data->phase == b3_preSolveDiscrete );
+	B3_ASSERT( 0 <= manifoldIndex && manifoldIndex < data->manifoldCount );
+	const b3Manifold* manifold = data->manifolds + manifoldIndex;
+	B3_ASSERT( 0 <= pointIndex && pointIndex < manifold->pointCount );
+	return b3OffsetPos( data->centerA, manifold->points[pointIndex].anchorA );
+}
+
+void b3PreSolve_SetPoint( b3PreSolveData* data, int manifoldIndex, int pointIndex, b3Pos point )
+{
+	B3_ASSERT( data != NULL && data->phase == b3_preSolveDiscrete );
+	B3_ASSERT( b3IsValidPosition( point ) );
+	B3_ASSERT( 0 <= manifoldIndex && manifoldIndex < data->manifoldCount );
+	b3Manifold* manifold = data->manifolds + manifoldIndex;
+	B3_ASSERT( 0 <= pointIndex && pointIndex < manifold->pointCount );
+	manifold->points[pointIndex].anchorA = b3SubPos( point, data->centerA );
+	manifold->points[pointIndex].anchorB = b3SubPos( point, data->centerB );
 }
 
 b3ContactData b3Contact_GetData( b3ContactId contactId )
@@ -693,25 +716,6 @@ static bool b3UpdateConvexContact( b3World* world, int workerIndex, b3Contact* c
 	b3Vec3 tangentVelocityB = b3RotateVector( xfB.q, materialB->tangentVelocity );
 	contact->tangentVelocity = b3Sub( tangentVelocityA, tangentVelocityB );
 
-	if ( world->preSolveFcn && ( contact->flags & b3_simEnablePreSolveEvents ) != 0 )
-	{
-		b3ShapeId shapeIdA = { shapeA->id + 1, world->worldId, shapeA->generation };
-		b3ShapeId shapeIdB = { shapeB->id + 1, world->worldId, shapeB->generation };
-
-		// this call assumes thread safety
-		b3Pos point = b3OffsetPos( xfA.p, contact->manifolds[0].points[0].anchorA );
-		b3Vec3 normal = contact->manifolds[0].normal;
-		touching = world->preSolveFcn( shapeIdA, shapeIdB, point, normal, world->preSolveContext );
-		if ( touching == false )
-		{
-			// disable contact
-			b3FreeManifolds( world, contact->manifolds, contact->manifoldCount );
-			contact->manifolds = NULL;
-			contact->manifoldCount = 0;
-			return false;
-		}
-	}
-
 	if ( ( shapeA->flags & b3_enableHitEvents ) || ( shapeB->flags & b3_enableHitEvents ) )
 	{
 		contact->flags |= b3_simEnableHitEvent;
@@ -721,6 +725,172 @@ static bool b3UpdateConvexContact( b3World* world, int workerIndex, b3Contact* c
 		contact->flags &= ~b3_simEnableHitEvent;
 	}
 
+	return true;
+}
+
+static bool b3InvokeDiscretePreSolve( b3World* world, b3Contact* contact, b3Shape* shapeA, b3Pos centerA, b3Shape* shapeB,
+									  b3Pos centerB, b3Arena arena )
+{
+	if ( world->preSolveFcn == NULL || ( contact->flags & b3_simEnablePreSolveEvents ) == 0 )
+	{
+		return true;
+	}
+
+	B3_ASSERT( shapeA->id == contact->shapeIdA );
+	B3_ASSERT( shapeB->id == contact->shapeIdB );
+
+	b3Manifold* allocatedManifolds = contact->manifolds;
+	int allocatedManifoldCount = contact->manifoldCount;
+	b3Manifold* originalManifolds = b3Bump( &arena, allocatedManifoldCount * sizeof( b3Manifold ) );
+	memcpy( originalManifolds, allocatedManifolds, allocatedManifoldCount * sizeof( b3Manifold ) );
+
+	b3PreSolveData data = {
+		.phase = b3_preSolveDiscrete,
+		.manifolds = allocatedManifolds,
+		.manifoldCount = allocatedManifoldCount,
+		.centerA = centerA,
+		.centerB = centerB,
+		.childIndexA = shapeA->type == b3_compoundShape ? contact->childIndex : B3_NULL_INDEX,
+		.childIndexB = B3_NULL_INDEX,
+		.triangleIndexA = B3_NULL_INDEX,
+		.triangleIndexB = B3_NULL_INDEX,
+	};
+
+	b3PreSolveData originalData = data;
+	b3ShapeId shapeIdA = { shapeA->id + 1, world->worldId, shapeA->generation };
+	b3ShapeId shapeIdB = { shapeB->id + 1, world->worldId, shapeB->generation };
+
+	// This call assumes thread safety. The callback may mutate the manifolds but does not own them.
+	bool enabled = world->preSolveFcn( shapeIdA, shapeIdB, &data, world->preSolveContext );
+	bool validOutput = data.phase == originalData.phase && data.manifolds == originalData.manifolds &&
+					   data.manifoldCount == originalData.manifoldCount && data.centerA.x == originalData.centerA.x &&
+					   data.centerA.y == originalData.centerA.y && data.centerA.z == originalData.centerA.z &&
+					   data.centerB.x == originalData.centerB.x && data.centerB.y == originalData.centerB.y &&
+					   data.centerB.z == originalData.centerB.z && data.childIndexA == originalData.childIndexA &&
+					   data.childIndexB == originalData.childIndexB && data.point.x == originalData.point.x &&
+					   data.point.y == originalData.point.y && data.point.z == originalData.point.z &&
+					   data.normal.x == originalData.normal.x && data.normal.y == originalData.normal.y &&
+					   data.normal.z == originalData.normal.z && data.fraction == originalData.fraction &&
+					   data.triangleIndexA == originalData.triangleIndexA && data.triangleIndexB == originalData.triangleIndexB;
+
+	int manifoldCount = 0;
+	if ( enabled && validOutput )
+	{
+		for ( int manifoldIndex = 0; manifoldIndex < allocatedManifoldCount; ++manifoldIndex )
+		{
+			b3Manifold* manifold = allocatedManifolds + manifoldIndex;
+			const b3Manifold* originalManifold = originalManifolds + manifoldIndex;
+			int sourcePointCount = originalManifold->pointCount;
+			if ( manifold->pointCount != sourcePointCount || sourcePointCount <= 0 || B3_MAX_MANIFOLD_POINTS < sourcePointCount ||
+				 b3IsNormalized( manifold->normal ) == false || manifold->twistImpulse != originalManifold->twistImpulse ||
+				 manifold->frictionImpulse.x != originalManifold->frictionImpulse.x ||
+				 manifold->frictionImpulse.y != originalManifold->frictionImpulse.y ||
+				 manifold->frictionImpulse.z != originalManifold->frictionImpulse.z ||
+				 manifold->rollingImpulse.x != originalManifold->rollingImpulse.x ||
+				 manifold->rollingImpulse.y != originalManifold->rollingImpulse.y ||
+				 manifold->rollingImpulse.z != originalManifold->rollingImpulse.z )
+			{
+				validOutput = false;
+				break;
+			}
+
+			bool normalChanged = manifold->normal.x != originalManifold->normal.x ||
+								 manifold->normal.y != originalManifold->normal.y ||
+								 manifold->normal.z != originalManifold->normal.z;
+			bool geometryChanged = normalChanged;
+			int pointCount = 0;
+			for ( int pointIndex = 0; pointIndex < sourcePointCount; ++pointIndex )
+			{
+				b3ManifoldPoint point = manifold->points[pointIndex];
+				const b3ManifoldPoint* originalPoint = originalManifold->points + pointIndex;
+				bool internalStateUnchanged =
+					point.baseSeparation == originalPoint->baseSeparation &&
+					point.normalImpulse == originalPoint->normalImpulse &&
+					point.totalNormalImpulse == originalPoint->totalNormalImpulse &&
+					point.normalVelocity == originalPoint->normalVelocity && point.featureId == originalPoint->featureId &&
+					point.triangleIndex == originalPoint->triangleIndex && point.persisted == originalPoint->persisted;
+				if ( internalStateUnchanged == false )
+				{
+					validOutput = false;
+					break;
+				}
+
+				if ( point.enabled == false )
+				{
+					geometryChanged = true;
+					continue;
+				}
+
+				bool valid = b3IsValidVec3( point.anchorA ) && b3IsValidVec3( point.anchorB ) &&
+							 b3IsValidFloat( point.separation ) && b3IsValidFloat( point.friction ) && point.friction >= 0.0f &&
+							 b3IsValidFloat( point.restitution ) && point.restitution >= 0.0f &&
+							 b3IsValidFloat( point.maxNormalImpulse ) && point.maxNormalImpulse >= 0.0f;
+				if ( valid == false )
+				{
+					validOutput = false;
+					break;
+				}
+
+				bool pointGeometryChanged =
+					point.anchorA.x != originalPoint->anchorA.x || point.anchorA.y != originalPoint->anchorA.y ||
+					point.anchorA.z != originalPoint->anchorA.z || point.anchorB.x != originalPoint->anchorB.x ||
+					point.anchorB.y != originalPoint->anchorB.y || point.anchorB.z != originalPoint->anchorB.z;
+				if ( normalChanged || pointGeometryChanged )
+				{
+					point.normalImpulse = 0.0f;
+					geometryChanged = true;
+				}
+
+				point.enabled = true;
+				manifold->points[pointCount++] = point;
+			}
+
+			if ( validOutput == false )
+			{
+				break;
+			}
+
+			if ( pointCount == 0 )
+			{
+				continue;
+			}
+
+			manifold->pointCount = pointCount;
+			if ( geometryChanged )
+			{
+				manifold->frictionImpulse = b3Vec3_zero;
+				manifold->rollingImpulse = b3Vec3_zero;
+				manifold->twistImpulse = 0.0f;
+			}
+			if ( manifoldCount != manifoldIndex )
+			{
+				allocatedManifolds[manifoldCount] = *manifold;
+			}
+			manifoldCount += 1;
+		}
+	}
+
+	if ( validOutput == false )
+	{
+		B3_ASSERT( false );
+	}
+
+	if ( enabled == false || validOutput == false || manifoldCount == 0 )
+	{
+		b3FreeManifolds( world, allocatedManifolds, allocatedManifoldCount );
+		contact->manifolds = NULL;
+		contact->manifoldCount = 0;
+		return false;
+	}
+
+	if ( manifoldCount != allocatedManifoldCount )
+	{
+		b3Manifold* manifolds = b3AllocateManifolds( world, manifoldCount );
+		memcpy( manifolds, allocatedManifolds, manifoldCount * sizeof( b3Manifold ) );
+		b3FreeManifolds( world, allocatedManifolds, allocatedManifoldCount );
+		contact->manifolds = manifolds;
+	}
+	contact->manifoldCount = manifoldCount;
 	return true;
 }
 
@@ -857,22 +1027,36 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 
 	if ( touching )
 	{
-		b3Vec3 centerA = b3RotateVector( xfA.q, localCenterA );
-		b3Vec3 centerB = b3RotateVector( xfB.q, localCenterB );
+		b3Vec3 centerOffsetA = b3RotateVector( xfA.q, localCenterA );
+		b3Vec3 centerOffsetB = b3RotateVector( xfB.q, localCenterB );
 
-		// Adjust anchors to be relative to center of mass
+		// Adjust anchors to be relative to center of mass and initialize mutable solver inputs.
 		for ( int i = 0; i < contact->manifoldCount; ++i )
 		{
 			b3Manifold* manifold = contact->manifolds + i;
 			for ( int j = 0; j < manifold->pointCount; ++j )
 			{
 				b3ManifoldPoint* mp = manifold->points + j;
-				mp->anchorA = b3Sub( mp->anchorA, centerA );
-				mp->anchorB = b3Sub( mp->anchorB, centerB );
+				mp->anchorA = b3Sub( mp->anchorA, centerOffsetA );
+				mp->anchorB = b3Sub( mp->anchorB, centerOffsetB );
+				mp->friction = contact->friction;
+				mp->restitution = contact->restitution;
+				mp->maxNormalImpulse = FLT_MAX;
+				mp->enabled = true;
 			}
 		}
 
-		contact->flags |= b3_simTouchingFlag;
+		b3Pos centerA = b3OffsetPos( xfA.p, centerOffsetA );
+		b3Pos centerB = b3OffsetPos( xfB.p, centerOffsetB );
+		touching = b3InvokeDiscretePreSolve( world, contact, shapeA, centerA, shapeB, centerB, arena );
+		if ( touching )
+		{
+			contact->flags |= b3_simTouchingFlag;
+		}
+		else
+		{
+			contact->flags &= ~b3_simTouchingFlag;
+		}
 	}
 	else
 	{

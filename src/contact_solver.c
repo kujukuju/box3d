@@ -162,6 +162,8 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 			contactConstraint->friction = contact->friction;
 			contactConstraint->restitution = contact->restitution;
 			contactConstraint->rollingResistance = contact->rollingResistance;
+			contactConstraint->usePointProperties =
+				world->preSolveFcn != NULL && ( contact->flags & b3_simEnablePreSolveEvents ) != 0;
 
 			b3ManifoldConstraint* manifoldConstraints = manifoldBase + specs[localIndex].manifoldStart;
 			contactConstraint->constraints = manifoldConstraints;
@@ -200,7 +202,14 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 					float s = mp->separation;
 					cp->baseSeparation = s - b3Dot( b3Sub( cp->rB, cp->rA ), normal );
 					cp->normalImpulse = warmStartScale * mp->normalImpulse;
+					if ( contactConstraint->usePointProperties )
+					{
+						cp->normalImpulse = b3MinFloat( cp->normalImpulse, mp->maxNormalImpulse );
+					}
 					cp->totalNormalImpulse = 0.0f;
+					cp->friction = mp->friction;
+					cp->restitution = mp->restitution;
+					cp->maxNormalImpulse = mp->maxNormalImpulse;
 
 					b3Vec3 rA = cp->rA;
 					b3Vec3 rB = cp->rB;
@@ -416,6 +425,7 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 		b3Softness softness = contactConstraint->softness;
 		float friction = contactConstraint->friction;
 		float rollingResistance = contactConstraint->rollingResistance;
+		bool usePointProperties = contactConstraint->usePointProperties;
 
 		for ( int j = 0; j < manifoldCount; ++j )
 		{
@@ -425,6 +435,7 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 			b3Vec3 normal = constraint->normal;
 
 			float totalNormalImpulse = 0.0f;
+			float totalFrictionLimit = 0.0f;
 			float totalTwistLimit = 0.0f;
 
 			for ( int pointIndex = 0; pointIndex < pointCount; ++pointIndex )
@@ -465,12 +476,24 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 
 				// clamp the accumulated impulse
 				float newImpulse = b3MaxFloat( cp->normalImpulse + deltaImpulse, 0.0f );
+				if ( usePointProperties )
+				{
+					newImpulse = b3MinFloat( newImpulse, cp->maxNormalImpulse );
+				}
 				deltaImpulse = newImpulse - cp->normalImpulse;
 				cp->normalImpulse = newImpulse;
 				cp->totalNormalImpulse += newImpulse;
 
 				totalNormalImpulse += newImpulse;
-				totalTwistLimit += cp->leverArm * cp->normalImpulse;
+				if ( usePointProperties )
+				{
+					totalFrictionLimit += cp->friction * newImpulse;
+					totalTwistLimit += cp->friction * cp->leverArm * newImpulse;
+				}
+				else
+				{
+					totalTwistLimit += cp->leverArm * cp->normalImpulse;
+				}
 
 				// apply normal impulse
 				b3Vec3 P = b3MulSV( deltaImpulse, normal );
@@ -491,7 +514,7 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 			// Central twist friction
 			{
 				float twistSpeed = b3Dot( constraint->normal, b3Sub( wB, wA ) );
-				float maxImpulse = friction * totalTwistLimit;
+				float maxImpulse = usePointProperties ? totalTwistLimit : friction * totalTwistLimit;
 				float deltaImpulse = -constraint->twistMass * twistSpeed;
 				float oldImpulse = constraint->twistImpulse;
 				constraint->twistImpulse = b3ClampFloat( oldImpulse + deltaImpulse, -maxImpulse, maxImpulse );
@@ -547,7 +570,7 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 					constraint->frictionImpulse.y + deltaImpulse.y,
 				};
 
-				float maxImpulse = friction * totalNormalImpulse;
+				float maxImpulse = usePointProperties ? totalFrictionLimit : friction * totalNormalImpulse;
 
 				// Clamp the accumulated impulse
 				float lengthSquared = b3Dot2( newImpulse, newImpulse );
@@ -602,7 +625,8 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 	{
 		const b3ContactConstraint* contactConstraint = constraints + constraintIndex;
 		float restitution = contactConstraint->restitution;
-		if ( restitution == 0.0f )
+		bool usePointProperties = contactConstraint->usePointProperties;
+		if ( usePointProperties == false && restitution == 0.0f )
 		{
 			continue;
 		}
@@ -654,11 +678,21 @@ void b3ApplyRestitution_Mesh( b3SolverBlock block, b3StepContext* context )
 				b3Vec3 vrA = b3Add( vA, b3Cross( wA, rA ) );
 				float vn = b3Dot( b3Sub( vrB, vrA ), normal );
 
+				float pointRestitution = usePointProperties ? cp->restitution : restitution;
+				if ( usePointProperties && pointRestitution == 0.0f )
+				{
+					continue;
+				}
+
 				// compute normal impulse
-				float impulse = -cp->normalMass * ( vn + restitution * cp->relativeVelocity );
+				float impulse = -cp->normalMass * ( vn + pointRestitution * cp->relativeVelocity );
 
 				// clamp the accumulated impulse
 				float newImpulse = b3MaxFloat( cp->normalImpulse + impulse, 0.0f );
+				if ( usePointProperties )
+				{
+					newImpulse = b3MinFloat( newImpulse, cp->maxNormalImpulse );
+				}
 				impulse = newImpulse - cp->normalImpulse;
 				cp->normalImpulse = newImpulse;
 				cp->totalNormalImpulse += impulse;
@@ -953,6 +987,9 @@ typedef struct b3ContactConstraintPointWide
 	b3FloatW normalImpulses;
 	b3FloatW totalNormalImpulses;
 	b3FloatW normalMasses;
+	b3FloatW frictions;
+	b3FloatW restitutions;
+	b3FloatW maxNormalImpulses;
 	b3FloatW leverArms;
 	b3FloatW relativeVelocities;
 } b3ContactConstraintPointWide;
@@ -991,6 +1028,7 @@ typedef struct b3ContactConstraintWide
 	b3FloatW massScale;
 	b3FloatW impulseScale;
 	b3FloatW restitution;
+	b3FloatW usePointProperties;
 
 	b3Manifold* manifolds[B3_SIMD_WIDTH];
 
@@ -1293,6 +1331,7 @@ void b3PrepareContacts_Convex( b3SolverBlock block, b3StepContext* context )
 				b3Contact* contact = b3Array_Get( world->contacts, contactId );
 				B3_ASSERT( contact->manifoldCount == 1 );
 				b3Manifold* manifold = contact->manifolds + 0;
+				bool usePointProperties = world->preSolveFcn != NULL && ( contact->flags & b3_simEnablePreSolveEvents ) != 0;
 
 				int indexA = contact->bodySimIndexA;
 				int indexB = contact->bodySimIndexB;
@@ -1396,6 +1435,7 @@ void b3PrepareContacts_Convex( b3SolverBlock block, b3StepContext* context )
 				( (float*)&constraint->friction )[lane] = contact->friction;
 				( (float*)&constraint->restitution )[lane] = contact->restitution;
 				( (float*)&constraint->rollingResistance )[lane] = contact->rollingResistance;
+				( (float*)&constraint->usePointProperties )[lane] = usePointProperties ? 1.0f : 0.0f;
 
 				( (float*)&constraint->tangentVelocity1 )[lane] = b3Dot( contact->tangentVelocity, tangent1 );
 				( (float*)&constraint->tangentVelocity2 )[lane] = b3Dot( contact->tangentVelocity, tangent2 );
@@ -1438,8 +1478,16 @@ void b3PrepareContacts_Convex( b3SolverBlock block, b3StepContext* context )
 					float baseSeparation = s - b3Dot( b3Sub( rB, rA ), normal );
 					( (float*)&cp->baseSeparations )[lane] = baseSeparation;
 
-					( (float*)&cp->normalImpulses )[lane] = warmStartScale * mp->normalImpulse;
+					float normalImpulse = warmStartScale * mp->normalImpulse;
+					if ( usePointProperties )
+					{
+						normalImpulse = b3MinFloat( normalImpulse, mp->maxNormalImpulse );
+					}
+					( (float*)&cp->normalImpulses )[lane] = normalImpulse;
 					( (float*)&cp->totalNormalImpulses )[lane] = 0.0f;
+					( (float*)&cp->frictions )[lane] = mp->friction;
+					( (float*)&cp->restitutions )[lane] = mp->restitution;
+					( (float*)&cp->maxNormalImpulses )[lane] = mp->maxNormalImpulse;
 
 					b3Vec3 rnA = b3Cross( rA, normal );
 					b3Vec3 rnB = b3Cross( rB, normal );
@@ -1528,6 +1576,9 @@ void b3PrepareContacts_Convex( b3SolverBlock block, b3StepContext* context )
 					( (float*)&cp->normalImpulses )[lane] = 0.0f;
 					( (float*)&cp->totalNormalImpulses )[lane] = 0.0f;
 					( (float*)&cp->normalMasses )[lane] = 0.0f;
+					( (float*)&cp->frictions )[lane] = 0.0f;
+					( (float*)&cp->restitutions )[lane] = 0.0f;
+					( (float*)&cp->maxNormalImpulses )[lane] = 0.0f;
 					( (float*)&cp->relativeVelocities )[lane] = 0.0f;
 					( (float*)&cp->leverArms )[lane] = 0.0f;
 				}
@@ -1627,6 +1678,7 @@ void b3SolveContacts_Convex( b3SolverBlock block, b3StepContext* context, bool u
 	for ( int wideIndex = block.startIndex; wideIndex < block.startIndex + block.count; ++wideIndex )
 	{
 		b3ContactConstraintWide* c = constraints + wideIndex;
+		b3FloatW pointPropertiesMask = b3GreaterThanW( c->usePointProperties, b3ZeroW() );
 
 		_Static_assert( B3_SIMD_WIDTH == 4, "width" );
 		int pointCount1 = b3MaxInt( c->pointCounts[0], c->pointCounts[1] );
@@ -1654,6 +1706,7 @@ void b3SolveContacts_Convex( b3SolverBlock block, b3StepContext* context, bool u
 		b3Vec3W dp = b3SubVW( bB.dp, bA.dp );
 
 		b3FloatW totalNormalImpulse = b3ZeroW();
+		b3FloatW totalFrictionLimit = b3ZeroW();
 		b3FloatW totalTwistLimit = b3ZeroW();
 
 		for ( int pointIndex = 0; pointIndex < pointCount; ++pointIndex )
@@ -1694,12 +1747,19 @@ void b3SolveContacts_Convex( b3SolverBlock block, b3StepContext* context, bool u
 
 			// Clamp the accumulated impulse
 			b3FloatW newImpulse = b3MaxW( b3SubW( cp->normalImpulses, negImpulse ), b3ZeroW() );
+			b3FloatW cappedImpulse = b3MinW( newImpulse, cp->maxNormalImpulses );
+			newImpulse = b3BlendW( newImpulse, cappedImpulse, pointPropertiesMask );
 			b3FloatW deltaImpulse = b3SubW( newImpulse, cp->normalImpulses );
 			cp->normalImpulses = newImpulse;
 			cp->totalNormalImpulses = b3AddW( cp->totalNormalImpulses, newImpulse );
 
 			totalNormalImpulse = b3AddW( totalNormalImpulse, newImpulse );
-			totalTwistLimit = b3AddW( totalTwistLimit, b3MulW( cp->leverArms, newImpulse ) );
+			totalFrictionLimit = b3AddW( totalFrictionLimit, b3MulW( cp->frictions, newImpulse ) );
+
+			b3FloatW twistContribution = b3MulW( cp->leverArms, newImpulse );
+			b3FloatW pointTwistContribution = b3MulW( cp->frictions, twistContribution );
+			twistContribution = b3BlendW( twistContribution, pointTwistContribution, pointPropertiesMask );
+			totalTwistLimit = b3AddW( totalTwistLimit, twistContribution );
 
 			// Apply contact impulse
 			b3Vec3W P = b3MulSVW( deltaImpulse, c->normal );
@@ -1749,7 +1809,8 @@ void b3SolveContacts_Convex( b3SolverBlock block, b3StepContext* context, bool u
 			// Central twist friction
 			{
 				b3FloatW twistSpeed = b3DotW( c->normal, b3SubVW( bB.w, bA.w ) );
-				b3FloatW maxLambda = b3MulW( c->friction, totalTwistLimit );
+				b3FloatW contactTwistLimit = b3MulW( c->friction, totalTwistLimit );
+				b3FloatW maxLambda = b3BlendW( contactTwistLimit, totalTwistLimit, pointPropertiesMask );
 				b3FloatW deltaImpulse = b3NegW( b3MulW( c->twistMass, twistSpeed ) );
 				b3FloatW oldImpulse = c->twistImpulse;
 				c->twistImpulse = b3SymClampW( b3AddW( oldImpulse, deltaImpulse ), maxLambda );
@@ -1783,8 +1844,8 @@ void b3SolveContacts_Convex( b3SolverBlock block, b3StepContext* context, bool u
 				deltaImpulse = (b3Vec2W){ b3NegW( deltaImpulse.x ), b3NegW( deltaImpulse.y ) };
 				b3Vec2W newImpulse = b3AddV2W( c->frictionImpulse, deltaImpulse );
 
-				b3FloatW friction = c->friction;
-				b3FloatW maxImpulse = b3MulW( friction, totalNormalImpulse );
+				b3FloatW contactFrictionLimit = b3MulW( c->friction, totalNormalImpulse );
+				b3FloatW maxImpulse = b3BlendW( contactFrictionLimit, totalFrictionLimit, pointPropertiesMask );
 
 				// Clamp the accumulated impulse
 				b3FloatW lengthSquared = b3AddW( b3MulW( newImpulse.x, newImpulse.x ), b3MulW( newImpulse.y, newImpulse.y ) );
@@ -1837,11 +1898,13 @@ void b3ApplyRestitution_Convex( b3SolverBlock block, b3StepContext* context )
 	{
 		b3ContactConstraintWide* c = constraints + i;
 
-		if ( b3AllZeroW( c->restitution ) )
+		if ( b3AllZeroW( c->usePointProperties ) && b3AllZeroW( c->restitution ) )
 		{
-			// No lanes have restitution. Common case.
+			// No ordinary lanes have restitution and no lanes use mutable point properties.
 			continue;
 		}
+
+		b3FloatW pointPropertiesMask = b3GreaterThanW( c->usePointProperties, zero );
 
 		_Static_assert( B3_SIMD_WIDTH == 4, "width" );
 		int pointCount1 = b3MaxInt( c->pointCounts[0], c->pointCounts[1] );
@@ -1853,17 +1916,16 @@ void b3ApplyRestitution_Convex( b3SolverBlock block, b3StepContext* context )
 		b3BodyStateW bA = b3GatherBodies( states, c->indexA );
 		b3BodyStateW bB = b3GatherBodies( states, c->indexB );
 
-		// Create a mask based on restitution so that lanes with no restitution are not affected
-		// by the calculations below.
-		b3FloatW restitutionMask = b3EqualsW( c->restitution, zero );
-
 		for ( int pointIndex = 0; pointIndex < pointCount; ++pointIndex )
 		{
 			b3ContactConstraintPointWide* cp = c->points + pointIndex;
 
+			b3FloatW restitution = b3BlendW( c->restitution, cp->restitutions, pointPropertiesMask );
+
 			// Set effective mass to zero if restitution should not be applied
 			b3FloatW mask1 = b3GreaterThanW( b3AddW( cp->relativeVelocities, threshold ), zero );
 			b3FloatW mask2 = b3EqualsW( cp->totalNormalImpulses, zero );
+			b3FloatW restitutionMask = b3EqualsW( restitution, zero );
 			b3FloatW mask = b3OrW( b3OrW( mask1, mask2 ), restitutionMask );
 			b3FloatW mass = b3BlendW( cp->normalMasses, zero, mask );
 
@@ -1877,10 +1939,12 @@ void b3ApplyRestitution_Convex( b3SolverBlock block, b3StepContext* context )
 			b3FloatW vn = b3DotW( b3SubVW( vrB, vrA ), c->normal );
 
 			// Compute normal impulse
-			b3FloatW negImpulse = b3MulW( mass, b3AddW( vn, b3MulW( c->restitution, cp->relativeVelocities ) ) );
+			b3FloatW negImpulse = b3MulW( mass, b3AddW( vn, b3MulW( restitution, cp->relativeVelocities ) ) );
 
 			// Clamp the accumulated impulse
 			b3FloatW newImpulse = b3MaxW( b3SubW( cp->normalImpulses, negImpulse ), b3ZeroW() );
+			b3FloatW cappedImpulse = b3MinW( newImpulse, cp->maxNormalImpulses );
+			newImpulse = b3BlendW( newImpulse, cappedImpulse, pointPropertiesMask );
 			b3FloatW deltaImpulse = b3SubW( newImpulse, cp->normalImpulses );
 			cp->normalImpulses = newImpulse;
 			cp->totalNormalImpulses = b3AddW( cp->totalNormalImpulses, deltaImpulse );

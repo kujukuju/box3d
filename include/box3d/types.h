@@ -72,20 +72,76 @@ typedef float b3RestitutionCallback( float restitutionA, uint64_t userMaterialId
 /// @ingroup world
 typedef bool b3CustomFilterFcn( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void* context );
 
+/// Identifies the stage that invoked a pre-solve callback.
+typedef enum b3PreSolvePhase
+{
+	/// A complete mutable contact manifold is available before the constraint solver runs.
+	b3_preSolveDiscrete,
+
+	/// A continuous collision candidate is available. Only returning false to reject the candidate has an effect.
+	b3_preSolveContinuous,
+} b3PreSolvePhase;
+
+/// Transient pre-solve data owned by Box3D.
+/// The data and borrowed manifold array are valid only for the duration of the callback and must not be retained.
+typedef struct b3PreSolveData
+{
+	/// The stage that invoked the callback.
+	b3PreSolvePhase phase;
+
+	/// Borrowed mutable manifolds for discrete contacts. Null during continuous collision.
+	/// Do not replace this pointer or retain it after the callback returns.
+	struct b3Manifold* manifolds;
+
+	/// Number of mutable manifolds. Zero during continuous collision.
+	/// This value and each manifold point count are read-only.
+	int manifoldCount;
+
+	/// Body center of mass for shape A. Valid for discrete contacts.
+	b3Pos centerA;
+
+	/// Body center of mass for shape B. Valid for discrete contacts.
+	b3Pos centerB;
+
+	/// Participating baked-compound child for shape A, or B3_NULL_INDEX.
+	int childIndexA;
+
+	/// Participating baked-compound child for shape B, or B3_NULL_INDEX.
+	int childIndexB;
+
+	/// Continuous collision candidate point. Read-only and valid only during continuous collision.
+	b3Pos point;
+
+	/// Continuous collision candidate normal. Read-only and valid only during continuous collision.
+	b3Vec3 normal;
+
+	/// Continuous collision candidate fraction. Read-only and valid only during continuous collision.
+	float fraction;
+
+	/// Continuous mesh or height-field triangle for shape A, or B3_NULL_INDEX.
+	int triangleIndexA;
+
+	/// Continuous mesh or height-field triangle for shape B, or B3_NULL_INDEX.
+	int triangleIndexB;
+} b3PreSolveData;
+
 /// Prototype for a pre-solve callback.
-/// This is called after a contact is updated. This allows you to inspect a
-/// collision before it goes to the solver.
+/// This is called for awake solid contacts when either shape has enabled pre-solve events.
+/// A discrete callback is invoked once per updated contact in the contact's authoritative shape A/B order.
+/// It may modify b3Manifold::normal and the documented mutable fields in b3ManifoldPoint. Use b3PreSolve_SetPoint
+/// to move a point. Set b3ManifoldPoint::enabled to false to remove a point for the current step. If all points are
+/// disabled, the contact is disabled for the step. Do not modify manifold pointers, manifold counts, or point counts.
+/// During continuous collision there is no solver manifold and all data fields are read-only; only returning false to reject
+/// the candidate has an effect.
 /// Notes:
 /// - this function must be thread-safe
-/// - this is only called if the shape has enabled pre-solve events
-/// - this may be called for awake dynamic bodies and sensors
+/// - this is only called if one of the shapes has enabled pre-solve events
 /// - this is not called for sensors
-/// Return false if you want to disable the contact this step
-/// This has limited information because it is used during CCD which does not have the
-/// full contact manifold.
+/// - the data and manifold pointers become invalid when the callback returns
+/// Return false to disable a discrete contact for the step or reject a continuous collision candidate.
 /// @warning Do not attempt to modify the world inside this callback
 /// @ingroup world
-typedef bool b3PreSolveFcn( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal, void* context );
+typedef bool b3PreSolveFcn( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context );
 
 /// Prototype callback for overlap queries.
 /// Called for each shape found in the query.
@@ -2589,11 +2645,24 @@ typedef struct b3ManifoldPoint
 	/// Location of the contact point relative to the bodyB center of mass in world space.
 	b3Vec3 anchorB;
 
-	/// The separation of the contact point, negative if penetrating
+	/// The separation of the contact point, negative if penetrating.
+	/// This may be modified during a discrete pre-solve callback.
 	float separation;
 
 	/// Cached separation used for contact recycling
 	float baseSeparation;
+
+	/// Current-step friction coefficient initialized from the contact materials.
+	/// This may be modified during a discrete pre-solve callback.
+	float friction;
+
+	/// Current-step restitution coefficient initialized from the contact materials.
+	/// This may be modified during a discrete pre-solve callback.
+	float restitution;
+
+	/// Current-step maximum accumulated normal impulse, initialized to FLT_MAX.
+	/// This may be modified during a discrete pre-solve callback.
+	float maxNormalImpulse;
 
 	/// The impulse along the manifold normal vector. Since Box3D uses sub-stepping, this is
 	/// result from the final sub-step.
@@ -2616,6 +2685,9 @@ typedef struct b3ManifoldPoint
 
 	/// Did this contact point exist in the previous step?
 	bool persisted;
+
+	/// Set false during a discrete pre-solve callback to remove this point for the current step.
+	bool enabled;
 } b3ManifoldPoint;
 
 /// A contact manifold describes the contact points between colliding shapes.
@@ -2625,7 +2697,8 @@ typedef struct b3Manifold
 	/// The manifold points. There may be 1 to 4 valid points.
 	b3ManifoldPoint points[B3_MAX_MANIFOLD_POINTS];
 
-	/// The unit normal vector in world space, points from shape A to shape B
+	/// The unit normal vector in world space, points from shape A to shape B.
+	/// This may be modified during a discrete pre-solve callback.
 	b3Vec3 normal;
 
 	/// Central friction angular impulse (applied about the normal)
@@ -2637,7 +2710,8 @@ typedef struct b3Manifold
 	/// Rolling resistance angular impulse
 	b3Vec3 rollingImpulse;
 
-	/// The number of contact points, will be 0 to 4
+	/// The number of contact points, will be 0 to 4.
+	/// This is read-only during a pre-solve callback. Disable individual points with b3ManifoldPoint::enabled.
 	int pointCount;
 
 } b3Manifold;

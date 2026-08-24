@@ -14,6 +14,9 @@ typedef struct b3ManifoldConstraintPoint
 	float normalImpulse;
 	float totalNormalImpulse;
 	float normalMass;
+	float friction;
+	float restitution;
+	float maxNormalImpulse;
 	float leverArm;
 } b3ManifoldConstraintPoint;
 
@@ -49,6 +52,7 @@ typedef struct b3ContactConstraint
 	float restitution;
 	float rollingResistance;
 	int manifoldCount;
+	bool usePointProperties;
 } b3ContactConstraint;
 
 int b3GetWideContactConstraintByteCount( void );

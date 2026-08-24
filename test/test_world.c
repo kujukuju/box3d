@@ -10,6 +10,7 @@
 #include "box3d/constants.h"
 #include "box3d/math_functions.h"
 
+#include <float.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -254,13 +255,28 @@ static bool CustomFilter( b3ShapeId shapeIdA, b3ShapeId shapeIdB, void* context 
 	return true;
 }
 
-static bool PreSolveStatic( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal, void* context )
+typedef struct PreSolveCapture
 {
-	(void)shapeIdA;
-	(void)shapeIdB;
-	(void)point;
-	(void)normal;
-	ENSURE( context == NULL );
+	b3ShapeId groundShapeId;
+	b3ShapeId sphereShapeId;
+	int callCount;
+	bool shapeIdsValid;
+} PreSolveCapture;
+
+static bool RejectPreSolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	ENSURE( data != NULL );
+
+	PreSolveCapture* capture = context;
+	if ( capture != NULL )
+	{
+		capture->callCount += 1;
+		capture->shapeIdsValid = capture->shapeIdsValid && data->phase == b3_preSolveDiscrete && data->manifoldCount > 0;
+
+		capture->shapeIdsValid = capture->shapeIdsValid && B3_ID_EQUALS( shapeIdA, capture->groundShapeId ) &&
+								 B3_ID_EQUALS( shapeIdB, capture->sphereShapeId );
+	}
+
 	return false;
 }
 
@@ -293,7 +309,7 @@ int TestWorldCoverage( void )
 	ENSURE( value == 100.0f );
 
 	b3World_SetCustomFilterCallback( worldId, CustomFilter, NULL );
-	b3World_SetPreSolveCallback( worldId, PreSolveStatic, NULL );
+	b3World_SetPreSolveCallback( worldId, RejectPreSolve, NULL );
 
 	b3Vec3 g = { 1.0f, 2.0f };
 	b3World_SetGravity( worldId, g );
@@ -325,6 +341,1264 @@ int TestWorldCoverage( void )
 
 	b3DestroyWorld( worldId );
 
+	return 0;
+}
+
+static int TestPreSolveRejectsContact( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3BoxHull groundBox = b3MakeBoxHull( 5.0f, 0.5f, 5.0f );
+	b3ShapeId groundShapeId = b3CreateHullShape( groundBodyId, &shapeDef, &groundBox.base );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, 2.0f, 0.0f };
+	b3BodyId sphereBodyId = b3CreateBody( worldId, &bodyDef );
+
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3Sphere sphere = { { 0.0f, 0.0f, 0.0f }, 0.5f };
+	b3ShapeId sphereShapeId = b3CreateSphereShape( sphereBodyId, &shapeDef, &sphere );
+
+	PreSolveCapture capture = {
+		.groundShapeId = groundShapeId,
+		.sphereShapeId = sphereShapeId,
+		.shapeIdsValid = true,
+	};
+	b3World_SetPreSolveCallback( worldId, RejectPreSolve, &capture );
+
+	for ( int i = 0; i < 90; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+
+	b3Pos spherePosition = b3Body_GetPosition( sphereBodyId );
+	ENSURE( capture.callCount > 0 );
+	ENSURE( capture.shapeIdsValid );
+	ENSURE( spherePosition.y < -1.0f );
+	ENSURE( b3Body_GetContactCapacity( sphereBodyId ) == 0 );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+typedef struct DisableAllPointsCapture
+{
+	int callCount;
+	int pointCount;
+} DisableAllPointsCapture;
+
+static bool DisableAllPreSolvePoints( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	(void)shapeIdA;
+	(void)shapeIdB;
+
+	DisableAllPointsCapture* capture = context;
+	ENSURE( data->phase == b3_preSolveDiscrete );
+	capture->callCount += 1;
+
+	for ( int manifoldIndex = 0; manifoldIndex < data->manifoldCount; ++manifoldIndex )
+	{
+		b3Manifold* manifold = data->manifolds + manifoldIndex;
+		for ( int pointIndex = 0; pointIndex < manifold->pointCount; ++pointIndex )
+		{
+			manifold->points[pointIndex].enabled = false;
+			capture->pointCount += 1;
+		}
+	}
+
+	return true;
+}
+
+static int TestPreSolveDisablesAllPoints( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull ground = b3MakeBoxHull( 3.0f, 0.5f, 3.0f );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateHullShape( groundBodyId, &shapeDef, &ground.base );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, 0.9f, 0.0f };
+	b3BodyId boxBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3CreateHullShape( boxBodyId, &shapeDef, &box.base );
+
+	DisableAllPointsCapture capture = { 0 };
+	b3World_SetPreSolveCallback( worldId, DisableAllPreSolvePoints, &capture );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+	ENSURE( capture.callCount == 1 );
+	ENSURE( capture.pointCount > 0 );
+	b3ContactData contactData[1];
+	ENSURE( b3Body_GetContactData( boxBodyId, contactData, ARRAY_COUNT( contactData ) ) == 0 );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+typedef struct MutablePreSolveCapture
+{
+	int callCount;
+	int sourcePointCount;
+	int enabledPointCount;
+	bool pointRoundTrip;
+} MutablePreSolveCapture;
+
+static bool ModifyPreSolveContact( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	(void)shapeIdA;
+	(void)shapeIdB;
+
+	MutablePreSolveCapture* capture = context;
+	if ( data->phase != b3_preSolveDiscrete )
+	{
+		return true;
+	}
+
+	capture->callCount += 1;
+	capture->sourcePointCount = 0;
+	capture->enabledPointCount = 0;
+	capture->pointRoundTrip = true;
+
+	for ( int manifoldIndex = 0; manifoldIndex < data->manifoldCount; ++manifoldIndex )
+	{
+		b3Manifold* manifold = data->manifolds + manifoldIndex;
+		manifold->normal = b3Normalize( manifold->normal );
+
+		for ( int pointIndex = 0; pointIndex < manifold->pointCount; ++pointIndex )
+		{
+			b3ManifoldPoint* point = manifold->points + pointIndex;
+			capture->sourcePointCount += 1;
+
+			b3Pos worldPoint = b3PreSolve_GetPoint( data, manifoldIndex, pointIndex );
+			b3PreSolve_SetPoint( data, manifoldIndex, pointIndex, worldPoint );
+			b3Pos roundTrip = b3PreSolve_GetPoint( data, manifoldIndex, pointIndex );
+			capture->pointRoundTrip = capture->pointRoundTrip && b3LengthSquared( b3SubPos( roundTrip, worldPoint ) ) < 1.0e-10f;
+
+			point->separation = -0.01f;
+			point->friction = 0.25f;
+			point->restitution = 0.75f;
+			point->maxNormalImpulse = 0.02f;
+
+			if ( pointIndex == 0 && manifold->pointCount > 1 )
+			{
+				point->enabled = false;
+			}
+			else
+			{
+				capture->enabledPointCount += 1;
+			}
+		}
+	}
+
+	return true;
+}
+
+static int TestPreSolveMutableContact( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull ground = b3MakeBoxHull( 3.0f, 0.5f, 3.0f );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateHullShape( groundBodyId, &shapeDef, &ground.base );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, 0.9f, 0.0f };
+	b3BodyId boxBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3CreateHullShape( boxBodyId, &shapeDef, &box.base );
+
+	MutablePreSolveCapture capture = { 0 };
+	b3World_SetPreSolveCallback( worldId, ModifyPreSolveContact, &capture );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+	ENSURE( capture.callCount == 1 );
+	ENSURE( capture.sourcePointCount > 1 );
+	ENSURE( capture.enabledPointCount == capture.sourcePointCount - 1 );
+	ENSURE( capture.pointRoundTrip );
+
+	b3ContactData contacts[4];
+	int contactCount = b3Body_GetContactData( boxBodyId, contacts, ARRAY_COUNT( contacts ) );
+	ENSURE( contactCount == 1 );
+
+	int pointCount = 0;
+	for ( int manifoldIndex = 0; manifoldIndex < contacts[0].manifoldCount; ++manifoldIndex )
+	{
+		const b3Manifold* manifold = contacts[0].manifolds + manifoldIndex;
+		for ( int pointIndex = 0; pointIndex < manifold->pointCount; ++pointIndex )
+		{
+			const b3ManifoldPoint* point = manifold->points + pointIndex;
+			pointCount += 1;
+			ENSURE_SMALL( point->separation + 0.01f, 1.0e-6f );
+			ENSURE_SMALL( point->friction - 0.25f, 1.0e-6f );
+			ENSURE_SMALL( point->restitution - 0.75f, 1.0e-6f );
+			ENSURE_SMALL( point->maxNormalImpulse - 0.02f, 1.0e-6f );
+			ENSURE( point->normalImpulse <= point->maxNormalImpulse + 1.0e-6f );
+			ENSURE( point->enabled );
+		}
+	}
+	ENSURE( pointCount == capture.enabledPointCount );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+typedef struct SolverPointOverride
+{
+	float friction;
+	float restitution;
+	float maxNormalImpulse;
+	int callCount;
+} SolverPointOverride;
+
+static bool OverrideSolverPointProperties( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	(void)shapeIdA;
+	(void)shapeIdB;
+
+	if ( data->phase != b3_preSolveDiscrete )
+	{
+		return true;
+	}
+
+	SolverPointOverride* override = context;
+	override->callCount += 1;
+	for ( int manifoldIndex = 0; manifoldIndex < data->manifoldCount; ++manifoldIndex )
+	{
+		b3Manifold* manifold = data->manifolds + manifoldIndex;
+		for ( int pointIndex = 0; pointIndex < manifold->pointCount; ++pointIndex )
+		{
+			b3ManifoldPoint* point = manifold->points + pointIndex;
+			point->friction = override->friction;
+			point->restitution = override->restitution;
+			point->maxNormalImpulse = override->maxNormalImpulse;
+		}
+	}
+
+	return true;
+}
+
+static int CheckCappedContact( b3BodyId bodyId, float maxNormalImpulse )
+{
+	b3ContactData contacts[4];
+	int contactCount = b3Body_GetContactData( bodyId, contacts, ARRAY_COUNT( contacts ) );
+	ENSURE( contactCount > 0 );
+
+	int pointCount = 0;
+	bool reachedCap = false;
+	for ( int contactIndex = 0; contactIndex < contactCount; ++contactIndex )
+	{
+		const b3ContactData* contact = contacts + contactIndex;
+		for ( int manifoldIndex = 0; manifoldIndex < contact->manifoldCount; ++manifoldIndex )
+		{
+			const b3Manifold* manifold = contact->manifolds + manifoldIndex;
+			for ( int pointIndex = 0; pointIndex < manifold->pointCount; ++pointIndex )
+			{
+				const b3ManifoldPoint* point = manifold->points + pointIndex;
+				pointCount += 1;
+				ENSURE_SMALL( point->maxNormalImpulse - maxNormalImpulse, 1.0e-6f );
+				ENSURE( point->normalImpulse <= maxNormalImpulse + 1.0e-6f );
+				reachedCap = reachedCap || point->normalImpulse >= maxNormalImpulse - 1.0e-6f;
+			}
+		}
+	}
+
+	ENSURE( pointCount > 0 );
+	ENSURE( reachedCap );
+	return 0;
+}
+
+static int TestPreSolveMaxNormalImpulse( void )
+{
+	const float maxNormalImpulse = 0.05f;
+	SolverPointOverride override = {
+		.friction = 0.0f,
+		.restitution = 1.0f,
+		.maxNormalImpulse = maxNormalImpulse,
+	};
+
+	// Convex contacts use the SIMD solver.
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3World_SetRestitutionThreshold( worldId, 0.0f );
+	b3World_SetPreSolveCallback( worldId, OverrideSolverPointProperties, &override );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3BoxHull ground = b3MakeBoxHull( 4.0f, 0.5f, 4.0f );
+	b3CreateHullShape( groundBodyId, &shapeDef, &ground.base );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, 0.95f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ 0.0f, -10.0f, 0.0f };
+	b3BodyId sphereBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3Sphere sphere = { b3Vec3_zero, 0.5f };
+	b3CreateSphereShape( sphereBodyId, &shapeDef, &sphere );
+
+	b3World_Step( worldId, 1.0f / 60.0f, 1 );
+	ENSURE( override.callCount > 0 );
+	ENSURE( CheckCappedContact( sphereBodyId, maxNormalImpulse ) == 0 );
+	ENSURE( b3Body_GetLinearVelocity( sphereBodyId ).y < -9.0f );
+	b3DestroyWorld( worldId );
+
+	// Mesh contacts use the scalar solver, including the overflow implementation.
+	override.callCount = 0;
+	worldId = b3CreateWorld( &worldDef );
+	b3World_SetRestitutionThreshold( worldId, 0.0f );
+	b3World_SetPreSolveCallback( worldId, OverrideSolverPointProperties, &override );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3MeshData* mesh = b3CreateGridMesh( 2, 2, 2.0f, 0, true );
+	ENSURE( mesh != NULL );
+	shapeDef = b3DefaultShapeDef();
+	b3CreateMeshShape( groundBodyId, &shapeDef, mesh, (b3Vec3){ 1.0f, 1.0f, 1.0f } );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, 0.45f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ 0.0f, -10.0f, 0.0f };
+	sphereBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3CreateSphereShape( sphereBodyId, &shapeDef, &sphere );
+
+	b3World_Step( worldId, 1.0f / 60.0f, 1 );
+	ENSURE( override.callCount > 0 );
+	ENSURE( CheckCappedContact( sphereBodyId, maxNormalImpulse ) == 0 );
+	ENSURE( b3Body_GetLinearVelocity( sphereBodyId ).y < -9.0f );
+
+	b3DestroyWorld( worldId );
+	b3DestroyMesh( mesh );
+	return 0;
+}
+
+static int TestPreSolveZeroRestitution( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3World_SetRestitutionThreshold( worldId, 0.0f );
+
+	SolverPointOverride override = {
+		.friction = 0.0f,
+		.restitution = 0.0f,
+		.maxNormalImpulse = FLT_MAX,
+	};
+	b3World_SetPreSolveCallback( worldId, OverrideSolverPointProperties, &override );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.baseMaterial.restitution = 1.0f;
+	b3BoxHull ground = b3MakeBoxHull( 6.0f, 0.5f, 4.0f );
+	b3CreateHullShape( groundBodyId, &shapeDef, &ground.base );
+
+	b3Sphere sphere = { b3Vec3_zero, 0.5f };
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ -2.0f, 0.95f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ 0.0f, -5.0f, 0.0f };
+	b3BodyId zeroRestitutionBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.baseMaterial.restitution = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3CreateSphereShape( zeroRestitutionBodyId, &shapeDef, &sphere );
+
+	bodyDef.position.x = 2.0f;
+	b3BodyId bounceBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef.enablePreSolveEvents = false;
+	b3CreateSphereShape( bounceBodyId, &shapeDef, &sphere );
+
+	b3World_Step( worldId, 1.0f / 60.0f, 1 );
+	float zeroRestitutionSpeed = b3Body_GetLinearVelocity( zeroRestitutionBodyId ).y;
+	float bounceSpeed = b3Body_GetLinearVelocity( bounceBodyId ).y;
+	ENSURE( override.callCount > 0 );
+	ENSURE( zeroRestitutionSpeed < 1.0f );
+	ENSURE( bounceSpeed > 4.0f );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+static int TestPreSolveFrictionAffectsSliding( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	SolverPointOverride override = {
+		.friction = 0.0f,
+		.restitution = 0.0f,
+		.maxNormalImpulse = FLT_MAX,
+	};
+	b3World_SetPreSolveCallback( worldId, OverrideSolverPointProperties, &override );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.baseMaterial.friction = 1.0f;
+	b3BoxHull ground = b3MakeBoxHull( 20.0f, 0.5f, 4.0f );
+	b3CreateHullShape( groundBodyId, &shapeDef, &ground.base );
+
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ -5.0f, 1.0f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ 5.0f, 0.0f, 0.0f };
+	bodyDef.motionLocks.angularX = true;
+	bodyDef.motionLocks.angularY = true;
+	bodyDef.motionLocks.angularZ = true;
+	b3BodyId zeroFrictionBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.baseMaterial.friction = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3CreateHullShape( zeroFrictionBodyId, &shapeDef, &box.base );
+
+	bodyDef.position.x = 5.0f;
+	b3BodyId frictionBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef.enablePreSolveEvents = false;
+	b3CreateHullShape( frictionBodyId, &shapeDef, &box.base );
+
+	for ( int i = 0; i < 30; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+
+	float zeroFrictionSpeed = b3Body_GetLinearVelocity( zeroFrictionBodyId ).x;
+	float frictionSpeed = b3Body_GetLinearVelocity( frictionBodyId ).x;
+	ENSURE( override.callCount > 0 );
+	ENSURE( zeroFrictionSpeed > 4.5f );
+	ENSURE( frictionSpeed < 1.0f );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+typedef struct NullPreSolveContactState
+{
+	b3Pos position;
+	b3Quat rotation;
+	b3Vec3 linearVelocity;
+	b3Vec3 angularVelocity;
+} NullPreSolveContactState;
+
+static int RunPreSolveContact( bool useMesh, bool enablePreSolveEvents, b3PreSolveFcn* preSolveFcn, void* preSolveContext,
+							   NullPreSolveContactState* result )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3World_SetPreSolveCallback( worldId, preSolveFcn, preSolveContext );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.baseMaterial.friction = 0.37f;
+
+	b3MeshData* mesh = NULL;
+	if ( useMesh )
+	{
+		mesh = b3CreateGridMesh( 4, 4, 2.0f, 0, true );
+		ENSURE( mesh != NULL );
+		b3CreateMeshShape( groundBodyId, &shapeDef, mesh, (b3Vec3){ 1.0f, 1.0f, 1.0f } );
+	}
+	else
+	{
+		b3BoxHull ground = b3MakeBoxHull( 10.0f, 0.5f, 10.0f );
+		b3CreateHullShape( groundBodyId, &shapeDef, &ground.base );
+	}
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, useMesh ? 0.49f : 0.99f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ 3.0f, 0.0f, 0.7f };
+	bodyDef.motionLocks.angularX = true;
+	bodyDef.motionLocks.angularY = true;
+	bodyDef.motionLocks.angularZ = true;
+	b3BodyId boxBodyId = b3CreateBody( worldId, &bodyDef );
+
+	// Keep mesh recycling policy identical so this test isolates solver property selection.
+	b3Body_EnableContactRecycling( boxBodyId, false );
+
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.baseMaterial.friction = 0.37f;
+	shapeDef.enablePreSolveEvents = enablePreSolveEvents;
+	b3CreateHullShape( boxBodyId, &shapeDef, &box.base );
+
+	for ( int i = 0; i < 20; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+
+	b3ContactData contacts[1];
+	ENSURE( b3Body_GetContactData( boxBodyId, contacts, ARRAY_COUNT( contacts ) ) == 1 );
+
+	memset( result, 0, sizeof( *result ) );
+	result->position = b3Body_GetPosition( boxBodyId );
+	result->rotation = b3Body_GetRotation( boxBodyId );
+	result->linearVelocity = b3Body_GetLinearVelocity( boxBodyId );
+	result->angularVelocity = b3Body_GetAngularVelocity( boxBodyId );
+
+	b3DestroyWorld( worldId );
+	if ( mesh != NULL )
+	{
+		b3DestroyMesh( mesh );
+	}
+	return 0;
+}
+
+static bool NullPreSolveContactStatesEqual( const NullPreSolveContactState* a, const NullPreSolveContactState* b )
+{
+	return a->position.x == b->position.x && a->position.y == b->position.y && a->position.z == b->position.z &&
+		   a->rotation.v.x == b->rotation.v.x && a->rotation.v.y == b->rotation.v.y && a->rotation.v.z == b->rotation.v.z &&
+		   a->rotation.s == b->rotation.s && a->linearVelocity.x == b->linearVelocity.x &&
+		   a->linearVelocity.y == b->linearVelocity.y && a->linearVelocity.z == b->linearVelocity.z &&
+		   a->angularVelocity.x == b->angularVelocity.x && a->angularVelocity.y == b->angularVelocity.y &&
+		   a->angularVelocity.z == b->angularVelocity.z;
+}
+
+static int TestNullPreSolveCallbackUsesOrdinaryContacts( void )
+{
+	NullPreSolveContactState ordinaryConvex;
+	NullPreSolveContactState flaggedConvex;
+	ENSURE( RunPreSolveContact( false, false, NULL, NULL, &ordinaryConvex ) == 0 );
+	ENSURE( RunPreSolveContact( false, true, NULL, NULL, &flaggedConvex ) == 0 );
+	ENSURE( NullPreSolveContactStatesEqual( &ordinaryConvex, &flaggedConvex ) );
+
+	NullPreSolveContactState ordinaryMesh;
+	NullPreSolveContactState flaggedMesh;
+	ENSURE( RunPreSolveContact( true, false, NULL, NULL, &ordinaryMesh ) == 0 );
+	ENSURE( RunPreSolveContact( true, true, NULL, NULL, &flaggedMesh ) == 0 );
+	ENSURE( NullPreSolveContactStatesEqual( &ordinaryMesh, &flaggedMesh ) );
+	return 0;
+}
+
+static bool ObservePreSolveContact( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	(void)shapeIdA;
+	(void)shapeIdB;
+
+	if ( data->phase == b3_preSolveDiscrete )
+	{
+		int* callCount = context;
+		*callCount += 1;
+	}
+
+	return true;
+}
+
+static int TestPreSolveNoOpPreservesWarmStart( void )
+{
+	NullPreSolveContactState ordinaryState;
+	NullPreSolveContactState observedState;
+	int callCount = 0;
+
+	// Contact recycling is disabled inside the helper for both worlds so this isolates callback warm starting.
+	ENSURE( RunPreSolveContact( false, false, NULL, NULL, &ordinaryState ) == 0 );
+	ENSURE( RunPreSolveContact( false, true, ObservePreSolveContact, &callCount, &observedState ) == 0 );
+	ENSURE( callCount > 1 );
+	ENSURE( NullPreSolveContactStatesEqual( &ordinaryState, &observedState ) );
+	return 0;
+}
+
+typedef struct RepeatedPreSolveCapture
+{
+	int callCount;
+} RepeatedPreSolveCapture;
+
+static bool CountPreSolveContact( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	(void)shapeIdA;
+	(void)shapeIdB;
+	RepeatedPreSolveCapture* capture = context;
+	if ( data->phase == b3_preSolveDiscrete )
+	{
+		capture->callCount += 1;
+	}
+	return true;
+}
+
+static int TestPreSolveRunsEveryStep( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull ground = b3MakeBoxHull( 3.0f, 0.5f, 3.0f );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateHullShape( groundBodyId, &shapeDef, &ground.base );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, 1.0f, 0.0f };
+	b3BodyId boxBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3CreateHullShape( boxBodyId, &shapeDef, &box.base );
+
+	RepeatedPreSolveCapture capture = { 0 };
+	b3World_SetPreSolveCallback( worldId, CountPreSolveContact, &capture );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( capture.callCount == 1 );
+
+	capture.callCount = 0;
+	for ( int i = 0; i < 8; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+
+	ENSURE( capture.callCount == 8 );
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+typedef struct SurfacePreSolveCapture
+{
+	b3ShapeId meshShapeId;
+	b3ShapeId meshBoxShapeId;
+	b3ShapeId heightShapeId;
+	b3ShapeId heightBoxShapeId;
+	uint64_t meshMaterialId;
+	uint64_t heightMaterialId;
+	bool sawMesh;
+	bool sawHeightField;
+	bool materialIdsValid;
+	bool orderValid;
+} SurfacePreSolveCapture;
+
+static bool CaptureSurfacePreSolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	SurfacePreSolveCapture* capture = context;
+	if ( data->phase != b3_preSolveDiscrete )
+	{
+		return true;
+	}
+
+	bool isMesh = B3_ID_EQUALS( shapeIdA, capture->meshShapeId );
+	bool isHeightField = B3_ID_EQUALS( shapeIdA, capture->heightShapeId );
+	if ( isMesh )
+	{
+		capture->orderValid = capture->orderValid && B3_ID_EQUALS( shapeIdB, capture->meshBoxShapeId );
+	}
+	else if ( isHeightField )
+	{
+		capture->orderValid = capture->orderValid && B3_ID_EQUALS( shapeIdB, capture->heightBoxShapeId );
+	}
+	else
+	{
+		capture->orderValid = false;
+	}
+
+	for ( int manifoldIndex = 0; manifoldIndex < data->manifoldCount; ++manifoldIndex )
+	{
+		b3Manifold* manifold = data->manifolds + manifoldIndex;
+		for ( int pointIndex = 0; pointIndex < manifold->pointCount; ++pointIndex )
+		{
+			b3ManifoldPoint* point = manifold->points + pointIndex;
+			if ( isMesh )
+			{
+				capture->sawMesh = capture->sawMesh || point->triangleIndex != B3_NULL_INDEX;
+				uint64_t materialId = b3Shape_GetContactMaterialId( shapeIdA, data->childIndexA, point->triangleIndex );
+				capture->materialIdsValid = capture->materialIdsValid && materialId == capture->meshMaterialId;
+			}
+			else if ( isHeightField )
+			{
+				capture->sawHeightField = capture->sawHeightField || point->triangleIndex != B3_NULL_INDEX;
+				uint64_t materialId = b3Shape_GetContactMaterialId( shapeIdA, data->childIndexA, point->triangleIndex );
+				capture->materialIdsValid = capture->materialIdsValid && materialId == capture->heightMaterialId;
+			}
+		}
+	}
+
+	return true;
+}
+
+typedef struct TogglePreSolveCapture
+{
+	b3ShapeId leftGroundShapeId;
+	b3ShapeId leftBoxShapeId;
+	b3ShapeId rightGroundShapeId;
+	b3ShapeId rightBoxShapeId;
+	int leftCount;
+	int rightCount;
+	bool orderValid;
+} TogglePreSolveCapture;
+
+static bool CountTogglePreSolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	TogglePreSolveCapture* capture = context;
+	if ( data->phase != b3_preSolveDiscrete )
+	{
+		return true;
+	}
+
+	if ( B3_ID_EQUALS( shapeIdA, capture->leftGroundShapeId ) && B3_ID_EQUALS( shapeIdB, capture->leftBoxShapeId ) )
+	{
+		capture->leftCount += 1;
+	}
+	else if ( B3_ID_EQUALS( shapeIdA, capture->rightGroundShapeId ) && B3_ID_EQUALS( shapeIdB, capture->rightBoxShapeId ) )
+	{
+		capture->rightCount += 1;
+	}
+	else
+	{
+		capture->orderValid = false;
+	}
+
+	return true;
+}
+
+static int TestPreSolveEnableAfterContact( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull leftGround = b3MakeOffsetBoxHull( 1.0f, 0.5f, 1.0f, (b3Vec3){ -2.0f, 0.0f, 0.0f } );
+	b3BoxHull rightGround = b3MakeOffsetBoxHull( 1.0f, 0.5f, 1.0f, (b3Vec3){ 2.0f, 0.0f, 0.0f } );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3ShapeId leftGroundShapeId = b3CreateHullShape( groundBodyId, &shapeDef, &leftGround.base );
+	b3ShapeId rightGroundShapeId = b3CreateHullShape( groundBodyId, &shapeDef, &rightGround.base );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.enableSleep = false;
+	bodyDef.motionLocks.angularX = true;
+	bodyDef.motionLocks.angularY = true;
+	bodyDef.motionLocks.angularZ = true;
+	bodyDef.position = (b3Pos){ -2.0f, 1.0f, 0.0f };
+	b3BodyId leftBoxBodyId = b3CreateBody( worldId, &bodyDef );
+	bodyDef.position.x = 2.0f;
+	b3BodyId rightBoxBodyId = b3CreateBody( worldId, &bodyDef );
+
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	b3ShapeId leftBoxShapeId = b3CreateHullShape( leftBoxBodyId, &shapeDef, &box.base );
+	b3ShapeId rightBoxShapeId = b3CreateHullShape( rightBoxBodyId, &shapeDef, &box.base );
+
+	TogglePreSolveCapture capture = {
+		.leftGroundShapeId = leftGroundShapeId,
+		.leftBoxShapeId = leftBoxShapeId,
+		.rightGroundShapeId = rightGroundShapeId,
+		.rightBoxShapeId = rightBoxShapeId,
+		.orderValid = true,
+	};
+	b3World_SetPreSolveCallback( worldId, CountTogglePreSolve, &capture );
+
+	// Establish both contacts while pre-solve is disabled.
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( capture.leftCount == 0 && capture.rightCount == 0 );
+	b3ContactData contactData[1];
+	ENSURE( b3Body_GetContactData( leftBoxBodyId, contactData, ARRAY_COUNT( contactData ) ) == 1 );
+	ENSURE( b3Body_GetContactData( rightBoxBodyId, contactData, ARRAY_COUNT( contactData ) ) == 1 );
+
+	// Enabling one shape updates its existing contact immediately. The enabled contact cannot recycle,
+	// so the callback runs on every subsequent narrow-phase update. The other shape on the same body
+	// must not affect its contact.
+	b3Shape_EnablePreSolveEvents( leftGroundShapeId, true );
+	for ( int i = 0; i < 4; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+
+	ENSURE( capture.leftCount == 4 );
+	ENSURE( capture.rightCount == 0 );
+	ENSURE( capture.orderValid );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+static int TestPreSolveDisableAfterContact( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull ground = b3MakeBoxHull( 3.0f, 0.5f, 3.0f );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.enablePreSolveEvents = true;
+	b3ShapeId groundShapeId = b3CreateHullShape( groundBodyId, &shapeDef, &ground.base );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.enableSleep = false;
+	bodyDef.position = (b3Pos){ 0.0f, 1.0f, 0.0f };
+	bodyDef.motionLocks.angularX = true;
+	bodyDef.motionLocks.angularY = true;
+	bodyDef.motionLocks.angularZ = true;
+	b3BodyId boxBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3ShapeId boxShapeId = b3CreateHullShape( boxBodyId, &shapeDef, &box.base );
+
+	TogglePreSolveCapture capture = {
+		.leftGroundShapeId = groundShapeId,
+		.leftBoxShapeId = boxShapeId,
+		.orderValid = true,
+	};
+	b3World_SetPreSolveCallback( worldId, CountTogglePreSolve, &capture );
+
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( capture.leftCount == 1 );
+
+	// The contact remains enabled while the other participating shape still requests pre-solve.
+	b3Shape_EnablePreSolveEvents( groundShapeId, false );
+	for ( int i = 0; i < 2; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+	ENSURE( capture.leftCount == 3 );
+
+	// Once both current shape flags are clear, the callback stops and ordinary recycling is eligible again.
+	b3Shape_EnablePreSolveEvents( boxShapeId, false );
+	for ( int i = 0; i < 4; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+	ENSURE( capture.leftCount == 3 );
+	ENSURE( capture.orderValid );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+typedef struct RecyclingPreSolveCapture
+{
+	int callCount;
+} RecyclingPreSolveCapture;
+
+static bool ModifyRecyclingPreSolveGeometry( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	(void)shapeIdA;
+	(void)shapeIdB;
+
+	if ( data->phase != b3_preSolveDiscrete )
+	{
+		return true;
+	}
+
+	RecyclingPreSolveCapture* capture = context;
+	capture->callCount += 1;
+	for ( int manifoldIndex = 0; manifoldIndex < data->manifoldCount; ++manifoldIndex )
+	{
+		b3Manifold* manifold = data->manifolds + manifoldIndex;
+		manifold->normal = (b3Vec3){ 1.0f, 0.0f, 0.0f };
+		for ( int pointIndex = 0; pointIndex < manifold->pointCount; ++pointIndex )
+		{
+			b3Pos point = { 4.0f + pointIndex, 4.0f, 4.0f };
+			b3PreSolve_SetPoint( data, manifoldIndex, pointIndex, point );
+			manifold->points[pointIndex].separation = -2.0f;
+			manifold->points[pointIndex].maxNormalImpulse = 0.0f;
+		}
+	}
+
+	return true;
+}
+
+static int TestPreSolveDisableRebuildsGeometry( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId groundBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull ground = b3MakeBoxHull( 3.0f, 0.5f, 3.0f );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateHullShape( groundBodyId, &shapeDef, &ground.base );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.enableSleep = false;
+	bodyDef.position = (b3Pos){ 0.0f, 0.9f, 0.0f };
+	bodyDef.motionLocks.angularX = true;
+	bodyDef.motionLocks.angularY = true;
+	bodyDef.motionLocks.angularZ = true;
+	b3BodyId boxBodyId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3ShapeId boxShapeId = b3CreateHullShape( boxBodyId, &shapeDef, &box.base );
+
+	RecyclingPreSolveCapture capture = { 0 };
+	b3World_SetPreSolveCallback( worldId, ModifyRecyclingPreSolveGeometry, &capture );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( capture.callCount == 1 );
+
+	b3ContactData contactData[1];
+	ENSURE( b3Body_GetContactData( boxBodyId, contactData, ARRAY_COUNT( contactData ) ) == 1 );
+	ENSURE( contactData[0].manifolds[0].normal.x > 0.9f );
+
+	b3Shape_EnablePreSolveEvents( boxShapeId, false );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	ENSURE( capture.callCount == 1 );
+	ENSURE( b3Body_GetContactData( boxBodyId, contactData, ARRAY_COUNT( contactData ) ) == 1 );
+
+	int pointCount = 0;
+	for ( int manifoldIndex = 0; manifoldIndex < contactData[0].manifoldCount; ++manifoldIndex )
+	{
+		const b3Manifold* manifold = contactData[0].manifolds + manifoldIndex;
+		ENSURE( manifold->normal.y > 0.9f );
+		ENSURE_SMALL( manifold->normal.x, 1.0e-5f );
+		for ( int pointIndex = 0; pointIndex < manifold->pointCount; ++pointIndex )
+		{
+			const b3ManifoldPoint* point = manifold->points + pointIndex;
+			pointCount += 1;
+			ENSURE( point->separation > -0.2f && point->separation < 0.05f );
+			ENSURE( b3LengthSquared( point->anchorA ) < 4.0f );
+		}
+	}
+	ENSURE( pointCount > 0 );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+static int TestPreSolveMeshAndHeightField( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3SurfaceMaterial meshMaterials[2] = { b3DefaultSurfaceMaterial(), b3DefaultSurfaceMaterial() };
+	meshMaterials[0].userMaterialId = 0x1111;
+	meshMaterials[1].userMaterialId = 0x1234;
+	b3Vec3 meshVertices[4] = {
+		{ -2.0f, 0.0f, -2.0f },
+		{ -2.0f, 0.0f, 2.0f },
+		{ 2.0f, 0.0f, 2.0f },
+		{ 2.0f, 0.0f, -2.0f },
+	};
+	int32_t meshIndices[6] = { 0, 1, 2, 0, 2, 3 };
+	uint8_t meshMaterialIndices[2] = { 1, 1 };
+	b3MeshDef meshDef = {
+		.vertices = meshVertices,
+		.indices = meshIndices,
+		.materialIndices = meshMaterialIndices,
+		.vertexCount = ARRAY_COUNT( meshVertices ),
+		.triangleCount = 2,
+		.identifyEdges = true,
+	};
+	b3MeshData* mesh = b3CreateMesh( &meshDef, NULL, 0 );
+	ENSURE( mesh != NULL );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId meshBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.materials = meshMaterials;
+	shapeDef.materialCount = ARRAY_COUNT( meshMaterials );
+	b3ShapeId meshShapeId = b3CreateMeshShape( meshBodyId, &shapeDef, mesh, (b3Vec3){ 1.0f, 1.0f, 1.0f } );
+
+	float heights[16] = { 0 };
+	uint8_t heightMaterialIndices[9];
+	memset( heightMaterialIndices, 1, sizeof( heightMaterialIndices ) );
+	b3HeightFieldDef heightDef = {
+		.heights = heights,
+		.materialIndices = heightMaterialIndices,
+		.scale = { 1.0f, 1.0f, 1.0f },
+		.countX = 4,
+		.countZ = 4,
+		.globalMinimumHeight = -1.0f,
+		.globalMaximumHeight = 1.0f,
+	};
+	b3HeightFieldData* heightField = b3CreateHeightField( &heightDef );
+	ENSURE( heightField != NULL );
+
+	b3SurfaceMaterial heightMaterials[2] = { b3DefaultSurfaceMaterial(), b3DefaultSurfaceMaterial() };
+	heightMaterials[0].userMaterialId = 0x2222;
+	heightMaterials[1].userMaterialId = 0x5678;
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	bodyDef.position = (b3Pos){ 10.0f, 0.0f, 0.0f };
+	b3BodyId heightBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.materials = heightMaterials;
+	shapeDef.materialCount = ARRAY_COUNT( heightMaterials );
+	b3ShapeId heightShapeId = b3CreateHeightFieldShape( heightBodyId, &shapeDef, heightField );
+
+	b3BoxHull box = b3MakeBoxHull( 0.5f, 0.5f, 0.5f );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.0f, 0.4f, 0.0f };
+	b3BodyId meshBoxBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeId meshBoxShapeId = b3CreateHullShape( meshBoxBodyId, &shapeDef, &box.base );
+
+	bodyDef.position = (b3Pos){ 11.5f, 0.4f, 1.5f };
+	b3BodyId heightBoxBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeId heightBoxShapeId = b3CreateHullShape( heightBoxBodyId, &shapeDef, &box.base );
+
+	SurfacePreSolveCapture capture = {
+		.meshShapeId = meshShapeId,
+		.meshBoxShapeId = meshBoxShapeId,
+		.heightShapeId = heightShapeId,
+		.heightBoxShapeId = heightBoxShapeId,
+		.meshMaterialId = meshMaterials[1].userMaterialId,
+		.heightMaterialId = heightMaterials[1].userMaterialId,
+		.materialIdsValid = true,
+		.orderValid = true,
+	};
+	b3World_SetPreSolveCallback( worldId, CaptureSurfacePreSolve, &capture );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+	ENSURE( capture.sawMesh );
+	ENSURE( capture.sawHeightField );
+	ENSURE( capture.materialIdsValid );
+	ENSURE( capture.orderValid );
+
+	b3DestroyWorld( worldId );
+	b3DestroyMesh( mesh );
+	b3DestroyHeightField( heightField );
+	return 0;
+}
+
+static int TestContactMaterialInvalidIndices( void )
+{
+	b3SurfaceMaterial materials[2] = { b3DefaultSurfaceMaterial(), b3DefaultSurfaceMaterial() };
+	materials[0].userMaterialId = 0xABC1;
+	materials[1].userMaterialId = 0xABC2;
+
+	b3MeshData* mesh = b3CreateGridMesh( 2, 2, 1.0f, 2, false );
+	ENSURE( mesh != NULL );
+	const uint8_t* meshMaterialIndices = b3GetMeshMaterialIndices( mesh );
+	ENSURE( meshMaterialIndices != NULL );
+	int nonzeroTriangleIndex = B3_NULL_INDEX;
+	for ( int triangleIndex = 0; triangleIndex < mesh->triangleCount; ++triangleIndex )
+	{
+		if ( meshMaterialIndices[triangleIndex] == 1 )
+		{
+			nonzeroTriangleIndex = triangleIndex;
+			break;
+		}
+	}
+	ENSURE( nonzeroTriangleIndex != B3_NULL_INDEX );
+
+	float heights[9] = { 0 };
+	uint8_t heightMaterialIndices[4] = { 1, 1, 1, 1 };
+	b3HeightFieldDef heightDef = {
+		.heights = heights,
+		.materialIndices = heightMaterialIndices,
+		.scale = { 1.0f, 1.0f, 1.0f },
+		.countX = 3,
+		.countZ = 3,
+		.globalMinimumHeight = -1.0f,
+		.globalMaximumHeight = 1.0f,
+	};
+	b3HeightFieldData* heightField = b3CreateHeightField( &heightDef );
+	ENSURE( heightField != NULL );
+
+	b3BoxHull compoundHull = b3MakeBoxHull( 0.25f, 0.25f, 0.25f );
+	b3SurfaceMaterial hullMaterial = b3DefaultSurfaceMaterial();
+	hullMaterial.userMaterialId = 0xC001;
+	b3CompoundHullDef hullDef = {
+		.hull = &compoundHull.base,
+		.transform = b3Transform_identity,
+		.material = hullMaterial,
+	};
+	b3CompoundMeshDef compoundMeshDef = {
+		.meshData = mesh,
+		.transform = { .p = { 3.0f, 0.0f, 0.0f }, .q = b3Quat_identity },
+		.scale = { 1.0f, 1.0f, 1.0f },
+		.materials = materials,
+		.materialCount = ARRAY_COUNT( materials ),
+	};
+	b3CompoundDef compoundDef = {
+		.hulls = &hullDef,
+		.hullCount = 1,
+		.meshes = &compoundMeshDef,
+		.meshCount = 1,
+	};
+	b3CompoundData* compound = b3CreateCompound( &compoundDef );
+	ENSURE( compound != NULL );
+
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	shapeDef.materials = materials;
+	shapeDef.materialCount = ARRAY_COUNT( materials );
+	b3BodyId meshBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeId meshShapeId = b3CreateMeshShape( meshBodyId, &shapeDef, mesh, b3Vec3_one );
+
+	b3BodyId heightBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeId heightShapeId = b3CreateHeightFieldShape( heightBodyId, &shapeDef, heightField );
+
+	b3BodyId compoundBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef = b3DefaultShapeDef();
+	b3ShapeId compoundShapeId = b3CreateBakedCompoundShape( compoundBodyId, &shapeDef, compound );
+
+	ENSURE( b3Shape_GetContactMaterialId( meshShapeId, B3_NULL_INDEX, nonzeroTriangleIndex ) == materials[1].userMaterialId );
+	ENSURE( b3Shape_GetContactMaterialId( meshShapeId, B3_NULL_INDEX, -1 ) == 0 );
+	ENSURE( b3Shape_GetContactMaterialId( meshShapeId, B3_NULL_INDEX, mesh->triangleCount ) == 0 );
+
+	int heightTriangleCount = 2 * ( heightField->rowCount - 1 ) * ( heightField->columnCount - 1 );
+	ENSURE( b3Shape_GetContactMaterialId( heightShapeId, B3_NULL_INDEX, 0 ) == materials[1].userMaterialId );
+	ENSURE( b3Shape_GetContactMaterialId( heightShapeId, B3_NULL_INDEX, -1 ) == 0 );
+	ENSURE( b3Shape_GetContactMaterialId( heightShapeId, B3_NULL_INDEX, heightTriangleCount ) == 0 );
+
+	int compoundMeshChildIndex = compound->capsuleCount + compound->hullCount;
+	int compoundChildCount = compound->capsuleCount + compound->hullCount + compound->meshCount + compound->sphereCount;
+	ENSURE( b3Shape_GetContactMaterialId( compoundShapeId, compoundMeshChildIndex, nonzeroTriangleIndex ) ==
+			materials[1].userMaterialId );
+	ENSURE( b3Shape_GetContactMaterialId( compoundShapeId, -1, nonzeroTriangleIndex ) == 0 );
+	ENSURE( b3Shape_GetContactMaterialId( compoundShapeId, compoundChildCount, nonzeroTriangleIndex ) == 0 );
+	ENSURE( b3Shape_GetContactMaterialId( compoundShapeId, compoundMeshChildIndex, -1 ) == 0 );
+	ENSURE( b3Shape_GetContactMaterialId( compoundShapeId, compoundMeshChildIndex, mesh->triangleCount ) == 0 );
+
+	b3DestroyWorld( worldId );
+	b3DestroyCompound( compound );
+	b3DestroyHeightField( heightField );
+	b3DestroyMesh( mesh );
+	return 0;
+}
+
+typedef struct CompactManifoldCapture
+{
+	b3ShapeId meshShapeId;
+	b3ShapeId sphereShapeId;
+	int callCount;
+	int sourceManifoldCount;
+	bool orderValid;
+} CompactManifoldCapture;
+
+static bool CompactOnePreSolveManifold( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	CompactManifoldCapture* capture = context;
+	if ( data->phase != b3_preSolveDiscrete )
+	{
+		return true;
+	}
+
+	capture->callCount += 1;
+	capture->orderValid =
+		capture->orderValid && B3_ID_EQUALS( shapeIdA, capture->meshShapeId ) && B3_ID_EQUALS( shapeIdB, capture->sphereShapeId );
+	capture->sourceManifoldCount = data->manifoldCount;
+	if ( data->manifoldCount > 1 )
+	{
+		b3Manifold* manifold = data->manifolds;
+		for ( int pointIndex = 0; pointIndex < manifold->pointCount; ++pointIndex )
+		{
+			manifold->points[pointIndex].enabled = false;
+		}
+	}
+
+	return true;
+}
+
+static int TestPreSolvePartialManifoldCompaction( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+
+	b3MeshData* mesh = b3CreateHollowBoxMesh( b3Vec3_zero, (b3Vec3){ 1.0f, 1.0f, 1.0f } );
+	ENSURE( mesh != NULL );
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId meshBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3ShapeId meshShapeId = b3CreateMeshShape( meshBodyId, &shapeDef, mesh, b3Vec3_one );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 0.7f, 0.7f, 0.0f };
+	b3BodyId sphereBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3Sphere sphere = { b3Vec3_zero, 0.5f };
+	b3ShapeId sphereShapeId = b3CreateSphereShape( sphereBodyId, &shapeDef, &sphere );
+
+	CompactManifoldCapture capture = {
+		.meshShapeId = meshShapeId,
+		.sphereShapeId = sphereShapeId,
+		.orderValid = true,
+	};
+	b3World_SetPreSolveCallback( worldId, CompactOnePreSolveManifold, &capture );
+	b3World_Step( worldId, 1.0f / 60.0f, 4 );
+
+	ENSURE( capture.callCount == 1 );
+	ENSURE( capture.sourceManifoldCount > 1 );
+	ENSURE( capture.orderValid );
+	b3ContactData contactData[1];
+	ENSURE( b3Body_GetContactData( sphereBodyId, contactData, ARRAY_COUNT( contactData ) ) == 1 );
+	ENSURE( contactData[0].manifoldCount == capture.sourceManifoldCount - 1 );
+	ENSURE( contactData[0].manifoldCount > 0 );
+
+	b3DestroyWorld( worldId );
+	b3DestroyMesh( mesh );
 	return 0;
 }
 
@@ -434,11 +1708,8 @@ static int TestContactEvents( void )
 		if ( events.beginCount > 0 && idsChecked == false )
 		{
 			b3ContactBeginTouchEvent be = events.beginEvents[0];
-			bool aIsSphere = B3_ID_EQUALS( be.shapeIdA, sphereShapeId );
-			bool bIsSphere = B3_ID_EQUALS( be.shapeIdB, sphereShapeId );
-			bool aIsGround = B3_ID_EQUALS( be.shapeIdA, groundShapeId );
-			bool bIsGround = B3_ID_EQUALS( be.shapeIdB, groundShapeId );
-			ENSURE( ( aIsSphere && bIsGround ) || ( aIsGround && bIsSphere ) );
+			ENSURE( B3_ID_EQUALS( be.shapeIdA, groundShapeId ) );
+			ENSURE( B3_ID_EQUALS( be.shapeIdB, sphereShapeId ) );
 			ENSURE( b3Contact_IsValid( be.contactId ) );
 			idsChecked = true;
 		}
@@ -1087,7 +2358,199 @@ static int TestExplosion( void )
 	return 0;
 }
 
-// Ensure correct move events from bodies involved in CCD.
+typedef struct ContinuousPreSolveCapture
+{
+	int continuousCount;
+	bool dataValid;
+} ContinuousPreSolveCapture;
+
+static bool RejectContinuousPreSolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	(void)shapeIdA;
+	(void)shapeIdB;
+	ContinuousPreSolveCapture* capture = context;
+	if ( data->phase == b3_preSolveContinuous )
+	{
+		capture->continuousCount += 1;
+		capture->dataValid = capture->dataValid && data->manifolds == NULL && data->manifoldCount == 0 &&
+							 b3IsValidPosition( data->point ) && b3IsNormalized( data->normal ) && 0.0f < data->fraction &&
+							 data->fraction < 1.0f;
+	}
+
+	return false;
+}
+
+static int TestContinuousPreSolveRejectsCandidate( void )
+{
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3World_EnableContinuous( worldId, true );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId wallId = b3CreateBody( worldId, &bodyDef );
+	b3BoxHull wall = b3MakeBoxHull( 0.1f, 5.0f, 5.0f );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3CreateHullShape( wallId, &shapeDef, &wall.base );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.gravityScale = 0.0f;
+	bodyDef.position = (b3Pos){ 3.0f, 0.0f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ -30.0f, 0.0f, 0.0f };
+	b3BodyId ballId = b3CreateBody( worldId, &bodyDef );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3Sphere sphere = { b3Vec3_zero, 0.25f };
+	b3CreateSphereShape( ballId, &shapeDef, &sphere );
+
+	ContinuousPreSolveCapture capture = { .dataValid = true };
+	b3World_SetPreSolveCallback( worldId, RejectContinuousPreSolve, &capture );
+	for ( int i = 0; i < 20; ++i )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+	}
+
+	ENSURE( capture.continuousCount > 0 );
+	ENSURE( capture.dataValid );
+	ENSURE( b3Body_GetPosition( ballId ).x < -1.0f );
+
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+typedef struct LaterContinuousCandidateCapture
+{
+	b3ShapeId staticShapeId;
+	b3ShapeId sphereShapeId;
+	int expectedChildIndex;
+	int rejectedNearCount;
+	int acceptedFarCount;
+	float nearFraction;
+	float farFraction;
+	bool dataValid;
+} LaterContinuousCandidateCapture;
+
+static bool SelectLaterContinuousCandidate( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	LaterContinuousCandidateCapture* capture = context;
+	if ( data->phase != b3_preSolveContinuous )
+	{
+		return true;
+	}
+
+	capture->dataValid = capture->dataValid && B3_ID_EQUALS( shapeIdA, capture->staticShapeId ) &&
+						 B3_ID_EQUALS( shapeIdB, capture->sphereShapeId ) && data->childIndexA == capture->expectedChildIndex &&
+						 data->childIndexB == B3_NULL_INDEX && data->triangleIndexA != B3_NULL_INDEX &&
+						 data->triangleIndexB == B3_NULL_INDEX;
+
+	if ( data->point.x > 0.5f )
+	{
+		capture->rejectedNearCount += 1;
+		capture->nearFraction = data->fraction;
+		return false;
+	}
+
+	capture->acceptedFarCount += 1;
+	capture->farFraction = data->fraction;
+	return true;
+}
+
+static int RunLaterContinuousCandidateTest( bool useCompound )
+{
+	b3Vec3 vertices[8] = {
+		{ 1.0f, -5.0f, -5.0f }, { 1.0f, 5.0f, -5.0f }, { 1.0f, 5.0f, 5.0f }, { 1.0f, -5.0f, 5.0f },
+		{ 0.0f, -5.0f, -5.0f }, { 0.0f, 5.0f, -5.0f }, { 0.0f, 5.0f, 5.0f }, { 0.0f, -5.0f, 5.0f },
+	};
+	int32_t indices[12] = { 0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7 };
+	b3MeshDef meshDef = {
+		.vertices = vertices,
+		.indices = indices,
+		.vertexCount = ARRAY_COUNT( vertices ),
+		.triangleCount = 4,
+	};
+	b3MeshData* mesh = b3CreateMesh( &meshDef, NULL, 0 );
+	ENSURE( mesh != NULL );
+
+	b3CompoundData* compound = NULL;
+	if ( useCompound )
+	{
+		b3SurfaceMaterial material = b3DefaultSurfaceMaterial();
+		b3CompoundMeshDef compoundMeshDef = {
+			.meshData = mesh,
+			.transform = b3Transform_identity,
+			.scale = b3Vec3_one,
+			.materials = &material,
+			.materialCount = 1,
+		};
+		b3CompoundDef compoundDef = {
+			.meshes = &compoundMeshDef,
+			.meshCount = 1,
+		};
+		compound = b3CreateCompound( &compoundDef );
+		ENSURE( compound != NULL );
+	}
+
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3World_EnableContinuous( worldId, true );
+
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_staticBody;
+	b3BodyId staticBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3ShapeId staticShapeId = useCompound ? b3CreateBakedCompoundShape( staticBodyId, &shapeDef, compound )
+										  : b3CreateMeshShape( staticBodyId, &shapeDef, mesh, b3Vec3_one );
+
+	bodyDef = b3DefaultBodyDef();
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.gravityScale = 0.0f;
+	bodyDef.position = (b3Pos){ 3.0f, 0.0f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ -210.0f, 0.0f, 0.0f };
+	b3BodyId sphereBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef = b3DefaultShapeDef();
+	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
+	b3Sphere sphere = { b3Vec3_zero, 0.25f };
+	b3ShapeId sphereShapeId = b3CreateSphereShape( sphereBodyId, &shapeDef, &sphere );
+
+	LaterContinuousCandidateCapture capture = {
+		.staticShapeId = staticShapeId,
+		.sphereShapeId = sphereShapeId,
+		.expectedChildIndex = useCompound ? 0 : B3_NULL_INDEX,
+		.dataValid = true,
+	};
+	b3World_SetPreSolveCallback( worldId, SelectLaterContinuousCandidate, &capture );
+	b3World_Step( worldId, 1.0f / 60.0f, 1 );
+
+	ENSURE( capture.rejectedNearCount > 0 );
+	ENSURE( capture.acceptedFarCount > 0 );
+	ENSURE( capture.nearFraction < capture.farFraction );
+	ENSURE( capture.dataValid );
+	b3Pos position = b3Body_GetPosition( sphereBodyId );
+	ENSURE( 0.15f < position.x && position.x < 0.5f );
+
+	b3DestroyWorld( worldId );
+	if ( compound != NULL )
+	{
+		b3DestroyCompound( compound );
+	}
+	b3DestroyMesh( mesh );
+	return 0;
+}
+
+static int TestContinuousPreSolveAcceptsLaterTriangle( void )
+{
+	ENSURE( RunLaterContinuousCandidateTest( false ) == 0 );
+	ENSURE( RunLaterContinuousCandidateTest( true ) == 0 );
+	return 0;
+}
+
+// Ensure correct move events from bodies involved in CCD and ensure a null pre-solve callback is safe.
 static int TestContinuousMoveEvent( void )
 {
 	b3WorldDef worldDef = b3DefaultWorldDef();
@@ -1112,6 +2575,7 @@ static int TestContinuousMoveEvent( void )
 	b3BodyId ballId = b3CreateBody( worldId, &bodyDef );
 	shapeDef = b3DefaultShapeDef();
 	shapeDef.density = 1.0f;
+	shapeDef.enablePreSolveEvents = true;
 	b3Sphere sphere = { { 0.0f, 0.0f, 0.0f }, 0.25f };
 	b3CreateSphereShape( ballId, &shapeDef, &sphere );
 
@@ -1166,8 +2630,25 @@ int WorldTest( void )
 	RUN_SUBTEST( TestIsValid );
 	RUN_SUBTEST( TestWorldRecycle );
 	RUN_SUBTEST( TestWorldCoverage );
+	RUN_SUBTEST( TestPreSolveRejectsContact );
+	RUN_SUBTEST( TestPreSolveDisablesAllPoints );
+	RUN_SUBTEST( TestPreSolveMutableContact );
+	RUN_SUBTEST( TestPreSolveMaxNormalImpulse );
+	RUN_SUBTEST( TestPreSolveZeroRestitution );
+	RUN_SUBTEST( TestPreSolveFrictionAffectsSliding );
+	RUN_SUBTEST( TestNullPreSolveCallbackUsesOrdinaryContacts );
+	RUN_SUBTEST( TestPreSolveNoOpPreservesWarmStart );
+	RUN_SUBTEST( TestPreSolveRunsEveryStep );
+	RUN_SUBTEST( TestPreSolveEnableAfterContact );
+	RUN_SUBTEST( TestPreSolveDisableAfterContact );
+	RUN_SUBTEST( TestPreSolveDisableRebuildsGeometry );
+	RUN_SUBTEST( TestPreSolveMeshAndHeightField );
+	RUN_SUBTEST( TestContactMaterialInvalidIndices );
+	RUN_SUBTEST( TestPreSolvePartialManifoldCompaction );
 	RUN_SUBTEST( TestExplosion );
 	RUN_SUBTEST( TestSensor );
+	RUN_SUBTEST( TestContinuousPreSolveRejectsCandidate );
+	RUN_SUBTEST( TestContinuousPreSolveAcceptsLaterTriangle );
 	RUN_SUBTEST( TestContinuousMoveEvent );
 	RUN_SUBTEST( TestContactEvents );
 	RUN_SUBTEST( TestHitEvents );

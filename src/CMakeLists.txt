@@ -130,7 +130,7 @@ set_target_properties(box3d PROPERTIES
     C_STANDARD_REQUIRED YES
     C_EXTENSIONS YES
     VERSION ${PROJECT_VERSION}
-    SOVERSION ${PROJECT_VERSION_MAJOR}
+    SOVERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}"
 	DEBUG_POSTFIX ${CMAKE_DEBUG_POSTFIX}
 )
 
@@ -250,7 +250,7 @@ include(CMakePackageConfigHelpers)
 write_basic_package_version_file(
   "${CMAKE_CURRENT_BINARY_DIR}/box3dConfigVersion.cmake"
   VERSION ${PROJECT_VERSION}
-  COMPATIBILITY SameMajorVersion
+  COMPATIBILITY SameMinorVersion
 )
 
 install(

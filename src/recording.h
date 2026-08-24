@@ -47,12 +47,12 @@ typedef struct b3World b3World;
 #define B3_REC_MAGIC 0x43523342u
 
 // Major recording version is bumped when writers change.
-// Major version 4 added b3ShapeDef::enableSpeculativeContact
-#define B3_REC_VERSION_MAJOR 4
+// Major version 5 uses snapshot layout version 3.
+#define B3_REC_VERSION_MAJOR 5
 
 // Minor tracks op-stream additions that keep the 48 byte header shape.
-// Minor version 4 added b3Shape_SetMeshMaterial, b3Shape_SetHull, b3Shape_SetMesh
-#define B3_REC_VERSION_MINOR 4
+// Minor version 0 starts major version 5.
+#define B3_REC_VERSION_MINOR 0
 
 // File header, fixed 48 bytes. Contains the registry locator so the player
 // can load geometry before replaying any ops.

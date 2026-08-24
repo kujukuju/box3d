@@ -2063,8 +2063,51 @@ static int GeometryMutatorReplay( void )
 	return 0;
 }
 
+static int RecordingVersionCompatibility( void )
+{
+	b3Recording* rec = b3CreateRecording( 0 );
+	ENSURE( rec != NULL );
+
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3World_StartRecording( worldId, rec );
+	b3World_StopRecording( worldId );
+	b3DestroyWorld( worldId );
+
+	const uint8_t* data = b3Recording_GetData( rec );
+	int size = b3Recording_GetSize( rec );
+	ENSURE( size >= (int)sizeof( b3RecHeader ) );
+
+	b3RecHeader header;
+	memcpy( &header, data, sizeof( header ) );
+	ENSURE( header.versionMajor == B3_REC_VERSION_MAJOR );
+	ENSURE( header.versionMinor == B3_REC_VERSION_MINOR );
+	ENSURE( header.versionMajor == 5 );
+	ENSURE( header.versionMinor == 0 );
+
+	uint8_t* patched = (uint8_t*)b3Alloc( (size_t)size );
+	memcpy( patched, data, (size_t)size );
+	b3RecHeader* patchedHeader = (b3RecHeader*)patched;
+
+	// Minor versions are additive and remain compatible within the same major version.
+	patchedHeader->versionMinor = UINT16_MAX;
+	b3RecPlayer* player = b3CreatePlayer( patched, size, 1 );
+	ENSURE( player != NULL );
+	b3DestroyPlayer( player );
+
+	// Snapshot layout changes are breaking and require a new major version.
+	patchedHeader->versionMajor = B3_REC_VERSION_MAJOR - 1;
+	patchedHeader->versionMinor = 0;
+	ENSURE( b3CreatePlayer( patched, size, 1 ) == NULL );
+
+	b3Free( patched, (size_t)size );
+	b3DestroyRecording( rec );
+	return 0;
+}
+
 int RecordingTest( void )
 {
+	RUN_SUBTEST( RecordingVersionCompatibility );
 	RUN_SUBTEST( GeometryHashCollision );
 	RUN_SUBTEST( ShapeNameReplay );
 	RUN_SUBTEST( SphereRoundTrip );

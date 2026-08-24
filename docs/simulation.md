@@ -1197,22 +1197,23 @@ b3World_SetCustomFilterCallback(myWorldId, MyCustomFilter, myGame);
 This function must be [thread-safe](https://en.wikipedia.org/wiki/Thread_safety) and must not read from or write to the Box3D world. Otherwise you will get a [race condition](https://en.wikipedia.org/wiki/Race_condition).
 
 #### Pre-Solve Callback
-This is called after collision detection, but before collision
-resolution. This gives you a chance to disable the contact based on the contact geometry. For example, you can implement a one-sided platform using this callback.
+This is called after collision detection, but before collision resolution. This gives you a chance to disable a contact based
+on its geometry. For example, you can implement a one-sided platform using this callback.
 
-The contact will be re-enabled each time through collision processing,
-so you will need to disable the contact every time-step. This function must be thread-safe
-and must not read from or write to the Box3D world.
+The contact is re-enabled each time through collision processing, so you must disable it every time step. This callback runs
+from simulation worker threads and must be thread-safe. It must not mutate the Box3D world. Only public queries explicitly
+documented as callback-safe may be used; for example, `b3Shape_GetContactMaterialId` is a read-only query that may be called
+from this callback.
 
-The pre-solve callback for Box3D receives the two shape ids, the contact point, and the contact normal:
+The callback receives the two shape ids in authoritative contact A/B order and a temporary `b3PreSolveData` owned by Box3D:
 
 ```c
 bool MyPreSolve(b3ShapeId shapeIdA, b3ShapeId shapeIdB,
-                b3Vec3 point, b3Vec3 normal, void* context)
+                b3PreSolveData* data, void* context)
 {
     MyGame* myGame = context;
 
-    if (myGame->ShouldDisableContact(shapeIdA, shapeIdB, point, normal))
+    if (myGame->ShouldDisableContact(shapeIdA, shapeIdB, data))
     {
         return false;
     }
@@ -1224,8 +1225,12 @@ bool MyPreSolve(b3ShapeId shapeIdA, b3ShapeId shapeIdB,
 b3World_SetPreSolveCallback(myWorldId, MyPreSolve, myGame);
 ```
 
-Note this currently does not work with high speed collisions, so you may see a
-pause in those situations.
+During `b3_preSolveDiscrete`, `data->manifolds` is a borrowed mutable array that is valid only for the callback. During the
+continuous collision phase, `data->phase` is `b3_preSolveContinuous`, the manifold pointer is null, and the callback receives
+read-only point, normal, fraction, child-index, and triangle-index data for the candidate. Returning false rejects that CCD
+candidate and allows Box3D to consider later candidates.
+
+The 0.2 callback and manifold ABI differs from 0.1. Consumers must rebuild against Box3D 0.2.
 
 ## Joints
 Joints are used to constrain bodies to the world or to each other.
@@ -1938,8 +1943,18 @@ are known. This is necessary for obtaining good simulation results efficiently. 
 of the time step then new contact points would not be known to the constraint solver and shapes would sink into each
 other.
 
-The `b3PreSolveFcn` is called within the parallel-for so it should be efficient and thread-safe. This is only called for
-shapes that have `enablePreSolveEvents == true`.
+The `b3PreSolveFcn` is called within the parallel-for, so it should be efficient and thread-safe. It is only called for
+solid contacts where at least one shape has `enablePreSolveEvents == true`. Contact recycling is disabled for these contacts,
+so an awake resting contact receives one discrete callback on every narrow-phase update. Shape ids are supplied in the
+contact's authoritative shape A/B order.
+
+For `b3_preSolveDiscrete`, `b3PreSolveData::manifolds` is a borrowed mutable array owned by Box3D. The callback may change
+the manifold normal, move a contact point with `b3PreSolve_SetPoint`, change point separation, friction, restitution, or
+maximum normal impulse, and disable individual points with `b3ManifoldPoint::enabled`. The array pointer, manifold count,
+and point counts are read-only. Returning false disables the contact for the step; returning true after disabling every
+point has the same result. The data and manifold pointers must not be retained after the callback returns. Use
+`b3Shape_GetContactMaterialId` with the supplied child index and each point's triangle index to resolve mesh, height-field,
+or compound materials.
 
 ### merge islands
 Simulation islands are merged when shapes begin touching. Existing islands that have shapes that stop touching
@@ -1969,7 +1984,10 @@ This stage does several tasks:
 
 This stage is a parallel-for.
 
-Note that continuous collision does not generate events. Instead they are generated the next time step. However, continuous collision will issue a `b3PreSolveFcn` callback.
+Note that continuous collision does not generate events. Instead they are generated the next time step. Continuous collision
+may issue a `b3PreSolveFcn` callback with `b3PreSolveData::phase == b3_preSolveContinuous`. In this phase the manifold pointer
+is null, the manifold count is zero, and the point, normal, fraction, child indices, and triangle indices are read-only.
+Returning false rejects the continuous collision candidate.
 
 ### hit events
 Active contacts are scanned for fast approach velocities and added to a buffer. This considers contact points that

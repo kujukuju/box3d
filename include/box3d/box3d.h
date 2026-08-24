@@ -160,7 +160,17 @@ B3_API float b3World_GetHitEventThreshold( b3WorldId worldId );
 B3_API void b3World_SetCustomFilterCallback( b3WorldId worldId, b3CustomFilterFcn* fcn, void* context );
 
 /// Register the pre-solve callback. This is optional.
+/// Discrete callback data contains borrowed mutable manifolds owned by Box3D and valid only until the callback returns.
+/// Continuous callback data contains a read-only collision candidate; only returning false to reject the candidate has an effect.
 B3_API void b3World_SetPreSolveCallback( b3WorldId worldId, b3PreSolveFcn* fcn, void* context );
+
+/// Get the world contact point represented by a discrete pre-solve manifold point.
+/// The pre-solve data must still be valid, the phase must be b3_preSolveDiscrete, and the indices must be in range.
+B3_API b3Pos b3PreSolve_GetPoint( const b3PreSolveData* data, int manifoldIndex, int pointIndex );
+
+/// Set both anchors of a discrete pre-solve manifold point from a world contact point.
+/// The pre-solve data must still be valid, the phase must be b3_preSolveDiscrete, and the indices must be in range.
+B3_API void b3PreSolve_SetPoint( b3PreSolveData* data, int manifoldIndex, int pointIndex, b3Pos point );
 
 /// Set the gravity vector for the entire world. Box3D has no concept of an up direction and this
 /// is left as a decision for the application. Usually in m/s^2.
@@ -786,7 +796,7 @@ B3_API int b3Body_CollideMover( b3BodyId bodyId, b3BodyPlaneResult* bodyPlanes, 
  * Functions to create, destroy, and access.
  * Shapes bind raw geometry to bodies and hold material properties including friction and restitution.
  * You may add multiple shapes to a single body. There are no hard limits on shape count per body.
- * 
+ *
  * When you create a shape on a body the center of mass moves. This can lead to the body linear velocity
  * changing if the angular velocity is non-zero.
  * @{
@@ -900,6 +910,13 @@ B3_API void b3Shape_SetMeshMaterial( b3ShapeId shapeId, b3SurfaceMaterial surfac
 
 /// Get a surface material for a mesh shape
 B3_API b3SurfaceMaterial b3Shape_GetMeshSurfaceMaterial( b3ShapeId shapeId, int index );
+
+/// Resolve the user material id for a contact point.
+/// For discrete contacts, use the child index from b3PreSolveData and triangle index from b3ManifoldPoint.
+/// For continuous candidates, use the child and triangle indices from b3PreSolveData.
+/// Pass B3_NULL_INDEX for shapes without a participating child or triangle.
+/// This is a read-only query and may be called from a pre-solve callback.
+B3_API uint64_t b3Shape_GetContactMaterialId( b3ShapeId shapeId, int childIndex, int triangleIndex );
 
 /// Get the shape filter
 B3_API b3Filter b3Shape_GetFilter( b3ShapeId shapeId );

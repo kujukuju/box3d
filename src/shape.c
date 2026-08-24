@@ -1490,7 +1490,45 @@ void b3Shape_EnablePreSolveEvents( b3ShapeId shapeId, bool flag )
 	B3_REC( world, ShapeEnablePreSolveEvents, shapeId, flag );
 
 	b3Shape* shape = b3GetShape( world, shapeId );
+	bool oldFlag = ( shape->flags & b3_enablePreSolveEvents ) != 0;
+	if ( oldFlag == flag )
+	{
+		return;
+	}
+
 	shape->flags = flag ? shape->flags | b3_enablePreSolveEvents : shape->flags & ~b3_enablePreSolveEvents;
+
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	int contactKey = body->headContactKey;
+	while ( contactKey != B3_NULL_INDEX )
+	{
+		int contactId = contactKey >> 1;
+		int edgeIndex = contactKey & 1;
+		b3Contact* contact = b3Array_Get( world->contacts, contactId );
+		contactKey = contact->edges[edgeIndex].nextKey;
+
+		if ( contact->shapeIdA != shape->id && contact->shapeIdB != shape->id )
+		{
+			continue;
+		}
+
+		const b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
+		const b3Shape* shapeB = b3Array_Get( world->shapes, contact->shapeIdB );
+		bool wasEnabled = ( contact->flags & b3_simEnablePreSolveEvents ) != 0;
+		bool isEnabled = ( shapeA->flags & b3_enablePreSolveEvents ) || ( shapeB->flags & b3_enablePreSolveEvents );
+		if ( isEnabled )
+		{
+			contact->flags |= b3_simEnablePreSolveEvents;
+		}
+		else
+		{
+			contact->flags &= ~b3_simEnablePreSolveEvents;
+			if ( wasEnabled )
+			{
+				contact->flags &= ~b3_relativeTransformValid;
+			}
+		}
+	}
 }
 
 bool b3Shape_ArePreSolveEventsEnabled( b3ShapeId shapeId )
@@ -2088,6 +2126,12 @@ void b3Shape_ApplyWind( b3ShapeId shapeId, b3Vec3 wind, float drag, float lift, 
 	sim->torque = b3Add( sim->torque, torque );
 }
 
+static bool b3AcceptTOICandidate( const b3TOIOutput* output, int childIndex, int triangleIndex, b3TOICandidateFcn* candidateFcn,
+								  void* candidateContext )
+{
+	return candidateFcn == NULL || candidateFcn( output, childIndex, triangleIndex, candidateContext );
+}
+
 typedef struct b3MeshImpactContext
 {
 	b3TOIInput toiInput;
@@ -2098,14 +2142,15 @@ typedef struct b3MeshImpactContext
 	b3Vec3 meshLocalCentroidB1, meshLocalCentroidB2;
 	float fallbackRadius;
 	bool isSensor;
+	int childIndex;
+	b3TOICandidateFcn* candidateFcn;
+	void* candidateContext;
 
 	int visitCount;
 } b3MeshImpactContext;
 
 static bool b3MeshTimeOfImpactFcn( b3Vec3 a, b3Vec3 b, b3Vec3 c, int triangleIndex, void* context )
 {
-	B3_UNUSED( triangleIndex );
-
 	b3MeshImpactContext* toiContext = context;
 
 	toiContext->visitCount += 1;
@@ -2140,8 +2185,12 @@ static bool b3MeshTimeOfImpactFcn( b3Vec3 a, b3Vec3 b, b3Vec3 c, int triangleInd
 
 	if ( 0.0f < output.fraction && output.fraction < toiContext->toiInput.maxFraction )
 	{
-		toiContext->toiOutput = output;
-		toiContext->toiInput.maxFraction = output.fraction;
+		if ( b3AcceptTOICandidate( &output, toiContext->childIndex, triangleIndex, toiContext->candidateFcn,
+								   toiContext->candidateContext ) )
+		{
+			toiContext->toiOutput = output;
+			toiContext->toiInput.maxFraction = output.fraction;
+		}
 	}
 	else if ( 0.0f == output.fraction )
 	{
@@ -2152,9 +2201,13 @@ static bool b3MeshTimeOfImpactFcn( b3Vec3 a, b3Vec3 b, b3Vec3 c, int triangleInd
 
 		if ( 0.0f < output.fraction && output.fraction < toiContext->toiInput.maxFraction )
 		{
-			toiContext->toiOutput = output;
-			toiContext->toiInput.maxFraction = output.fraction;
-			toiContext->toiOutput.usedFallback = true;
+			output.usedFallback = true;
+			if ( b3AcceptTOICandidate( &output, toiContext->childIndex, triangleIndex, toiContext->candidateFcn,
+									   toiContext->candidateContext ) )
+			{
+				toiContext->toiOutput = output;
+				toiContext->toiInput.maxFraction = output.fraction;
+			}
 		}
 	}
 
@@ -2174,6 +2227,8 @@ typedef struct b3CompoundImpactContext
 	// Centroid of shape in body B local space
 	b3Vec3 localCentroidB;
 	float fallbackRadius;
+	b3TOICandidateFcn* candidateFcn;
+	void* candidateContext;
 } b3CompoundImpactContext;
 
 // Implements b3CompoundQueryFcn
@@ -2184,6 +2239,7 @@ static bool b3CompoundTimeOfImpactFcn( const b3CompoundData* compound, int child
 	b3ChildShape child = b3GetCompoundChild( compound, childIndex );
 
 	b3TOIOutput output = { 0 };
+	bool candidateHandled = false;
 	toiContext->toiInput.sweepA = b3MakeCompoundChildSweep( toiContext->compoundTransform, child.transform );
 
 	switch ( child.type )
@@ -2213,6 +2269,10 @@ static bool b3CompoundTimeOfImpactFcn( const b3CompoundData* compound, int child
 			meshContext.isSensor = false;
 			meshContext.localCentroidB = toiContext->localCentroidB;
 			meshContext.fallbackRadius = toiContext->fallbackRadius;
+			meshContext.childIndex = childIndex;
+			meshContext.candidateFcn = toiContext->candidateFcn;
+			meshContext.candidateContext = toiContext->candidateContext;
+			candidateHandled = true;
 
 			b3Transform meshWorldTransform = b3MulTransforms( toiContext->compoundTransform, child.transform );
 
@@ -2255,7 +2315,9 @@ static bool b3CompoundTimeOfImpactFcn( const b3CompoundData* compound, int child
 			break;
 	}
 
-	if ( 0.0f < output.fraction && output.fraction < toiContext->toiInput.maxFraction )
+	if ( 0.0f < output.fraction && output.fraction < toiContext->toiInput.maxFraction &&
+		 ( candidateHandled ||
+		   b3AcceptTOICandidate( &output, childIndex, B3_NULL_INDEX, toiContext->candidateFcn, toiContext->candidateContext ) ) )
 	{
 		toiContext->toiOutput = output;
 		toiContext->toiInput.maxFraction = output.fraction;
@@ -2268,7 +2330,8 @@ static bool b3CompoundTimeOfImpactFcn( const b3CompoundData* compound, int child
 	return true;
 }
 
-b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction )
+b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction,
+								 b3TOICandidateFcn* candidateFcn, void* candidateContext )
 {
 	bool isSensor = shapeA->sensorIndex != B3_NULL_INDEX;
 
@@ -2280,6 +2343,8 @@ b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* swee
 		context.toiInput.proxyB = b3MakeShapeProxy( shapeB );
 		context.toiInput.sweepB = *sweepB;
 		context.toiInput.maxFraction = maxFraction;
+		context.candidateFcn = candidateFcn;
+		context.candidateContext = candidateContext;
 
 		context.compoundTransform = (b3Transform){
 			.p = sweepA->c1,
@@ -2318,6 +2383,9 @@ b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* swee
 		context.toiInput.sweepB = *sweepB;
 		context.toiInput.maxFraction = maxFraction;
 		context.isSensor = isSensor;
+		context.childIndex = B3_NULL_INDEX;
+		context.candidateFcn = candidateFcn;
+		context.candidateContext = candidateContext;
 
 		b3Vec3 localCentroidB = b3GetShapeCentroid( shapeB );
 		context.localCentroidB = localCentroidB;
@@ -2379,6 +2447,11 @@ b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* swee
 	input.maxFraction = maxFraction;
 
 	b3TOIOutput output = b3TimeOfImpact( &input );
+	if ( 0.0f < output.fraction && output.fraction < maxFraction &&
+		 b3AcceptTOICandidate( &output, B3_NULL_INDEX, B3_NULL_INDEX, candidateFcn, candidateContext ) == false )
+	{
+		return (b3TOIOutput){ 0 };
+	}
 
 #if 0
 	// todo I'm not sure this is worth it for convex vs convex.
@@ -2405,6 +2478,13 @@ b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* swee
 // the contact's childIndex to find the participating child, then for a mesh child apply the
 // child's materialIndices indirection on top of the per-triangle index. Convex shapes fall
 // back to materials[0]. childIndex is unused for non-compound shapes.
+uint64_t b3Shape_GetContactMaterialId( b3ShapeId shapeId, int childIndex, int triangleIndex )
+{
+	b3World* world = b3GetWorld( shapeId.world0 );
+	const b3Shape* shape = b3GetShape( world, shapeId );
+	return b3GetShapeUserMaterialId( shape, childIndex, triangleIndex );
+}
+
 uint64_t b3GetShapeUserMaterialId( const b3Shape* shape, int childIndex, int triangleIndex )
 {
 	if ( shape->materialCount == 0 )
@@ -2415,7 +2495,13 @@ uint64_t b3GetShapeUserMaterialId( const b3Shape* shape, int childIndex, int tri
 	int materialIndex = 0;
 	if ( shape->type == b3_meshShape )
 	{
-		const uint8_t* indices = b3GetMeshMaterialIndices( shape->mesh.data );
+		const b3MeshData* mesh = shape->mesh.data;
+		if ( triangleIndex < 0 || mesh->triangleCount <= triangleIndex )
+		{
+			return 0;
+		}
+
+		const uint8_t* indices = b3GetMeshMaterialIndices( mesh );
 		if ( indices != NULL )
 		{
 			materialIndex = indices[triangleIndex];
@@ -2423,14 +2509,33 @@ uint64_t b3GetShapeUserMaterialId( const b3Shape* shape, int childIndex, int tri
 	}
 	else if ( shape->type == b3_heightShape )
 	{
+		int triangleCount = b3GetHeightFieldTriangleCount( shape->heightField );
+		if ( triangleIndex < 0 || triangleCount <= triangleIndex )
+		{
+			return 0;
+		}
+
 		materialIndex = b3GetHeightFieldMaterial( shape->heightField, triangleIndex );
 	}
 	else if ( shape->type == b3_compoundShape )
 	{
-		b3ChildShape child = b3GetCompoundChild( shape->compound, childIndex );
+		const b3CompoundData* compound = shape->compound;
+		int childCount = compound->capsuleCount + compound->hullCount + compound->meshCount + compound->sphereCount;
+		if ( childIndex < 0 || childCount <= childIndex )
+		{
+			return 0;
+		}
+
+		b3ChildShape child = b3GetCompoundChild( compound, childIndex );
 		if ( child.type == b3_meshShape )
 		{
-			const uint8_t* indices = b3GetMeshMaterialIndices( child.mesh.data );
+			const b3MeshData* mesh = child.mesh.data;
+			if ( triangleIndex < 0 || mesh->triangleCount <= triangleIndex )
+			{
+				return 0;
+			}
+
+			const uint8_t* indices = b3GetMeshMaterialIndices( mesh );
 			int meshMaterialIndex = indices != NULL ? indices[triangleIndex] : 0;
 			meshMaterialIndex = b3ClampInt( meshMaterialIndex, 0, B3_MAX_COMPOUND_MESH_MATERIALS - 1 );
 			materialIndex = child.materialIndices[meshMaterialIndex];

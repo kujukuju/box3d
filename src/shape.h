@@ -96,6 +96,8 @@ float b3GetShapeArea( const b3Shape* shape );
 float b3GetShapeProjectedArea( const b3Shape* shape, b3Vec3 planeNormal );
 uint64_t b3GetShapeUserMaterialId( const b3Shape* shape, int childIndex, int triangleIndex );
 
+typedef bool b3TOICandidateFcn( const b3TOIOutput* output, int childIndex, int triangleIndex, void* context );
+
 b3ShapeProxy b3MakeShapeProxy( const b3Shape* shape );
 b3ShapeProxy b3MakeLocalProxy( const b3ShapeProxy* proxy, b3Transform transform, b3Vec3* buffer );
 b3AABB b3ComputeProxyAABB( const b3ShapeProxy* proxy );
@@ -106,7 +108,8 @@ bool b3OverlapShape( const b3Shape* shape, b3Transform transform, const b3ShapeP
 
 float b3GetShapeArea( const b3Shape* shape );
 float b3GetShapeProjectedArea( const b3Shape* shape, b3Vec3 planeNormal );
-b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction );
+b3TOIOutput b3ShapeTimeOfImpact( b3Shape* shapeA, b3Shape* shapeB, b3Sweep* sweepA, b3Sweep* sweepB, float maxFraction,
+								 b3TOICandidateFcn* candidateFcn, void* candidateContext );
 
 int b3CollideMoverAndSphere( b3PlaneResult* result, const b3Sphere* shape, const b3Capsule* mover );
 int b3CollideMoverAndCapsule( b3PlaneResult* result, const b3Capsule* shape, const b3Capsule* mover );
