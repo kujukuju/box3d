@@ -1949,12 +1949,40 @@ so an awake resting contact receives one discrete callback on every narrow-phase
 contact's authoritative shape A/B order.
 
 For `b3_preSolveDiscrete`, `b3PreSolveData::manifolds` is a borrowed mutable array owned by Box3D. The callback may change
-the manifold normal, move a contact point with `b3PreSolve_SetPoint`, change point separation, friction, restitution, or
+the manifold normal, `maxPushSpeed`, and `contactDampingRatio`, move a contact point with `b3PreSolve_SetPoint`, change point separation, friction, restitution, or
 maximum normal impulse, and disable individual points with `b3ManifoldPoint::enabled`. The array pointer, manifold count,
 and point counts are read-only. Returning false disables the contact for the step; returning true after disabling every
 point has the same result. The data and manifold pointers must not be retained after the callback returns. Use
 `b3Shape_GetContactMaterialId` with the supplied child index and each point's triangle index to resolve mesh, height-field,
 or compound materials.
+
+`b3PreSolveData::contactId` is read-only and identifies the contact during discrete pre-solve. During continuous
+pre-solve it identifies a touching contact for the exact shape pair and compound child only when a valid, enabled
+discrete callback completed for that contact in the same advancing time step. Otherwise it is null, including contacts
+woken after narrow phase whose manifolds were not updated this step. A non-null id may be passed to `b3Contact_GetData`
+to read the contact's solved manifolds. These are borrowed, read-only data: do not mutate them or retain their pointers.
+The returned contact uses its authoritative shape A/B order, which can differ from the continuous candidate's order.
+A mesh contact can contain other triangles: the id does not establish a triangle match or authorize rejecting a candidate.
+The continuous callback still receives null `manifolds` and zero `manifoldCount`; only its boolean return affects CCD.
+
+`b3Manifold::maxPushSpeed` limits normal penetration-recovery bias in length units per second. It is initialized from the
+world's `contactSpeed` on every contact update and may be overridden with a finite, nonnegative value during discrete
+pre-solve. Zero disables recovery bias without disabling normal collision response; `FLT_MAX` removes this speed cap while
+retaining the existing contact softness. The override does not change speculative-contact bias, restitution, friction, or
+continuous collision. Contacts without an active pre-solve callback continue to use the current world setting, including
+recycled contacts.
+
+`b3Manifold::contactDampingRatio` overrides contact damping for one manifold for the current step. It resets to `-1`
+on every discrete contact update; `-1` uses the existing world softness without recomputing it. An override must be
+finite and nonnegative. It uses the same effective Hertz as world tuning: `min(contactHertz, 0.125 / h)`, where `h`
+is the sub-step duration. Static contacts retain double this Hertz and half the supplied damping ratio. Thus a local
+value of `1` matches world damping `1` for the selected manifold without retuning other contacts. The override only
+applies to contacts with an active pre-solve callback; ordinary and recycled contacts retain the existing world softness.
+It does not change the penetration-recovery speed cap, speculative-contact bias, restitution, or continuous collision.
+
+Both manifold tuning overrides require a successful discrete callback in the current advancing time step. A sleeping
+contact woken after narrow phase may still expose old manifold tuning fields, but its first resumed solve uses the
+current world speed cap and softness until a fresh callback runs. This does not change existing point-property semantics.
 
 ### merge islands
 Simulation islands are merged when shapes begin touching. Existing islands that have shapes that stop touching

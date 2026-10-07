@@ -36,6 +36,8 @@ typedef struct b3ManifoldConstraint
 	b3Vec3 rollingImpulse;
 	float tangentVelocity1;
 	float tangentVelocity2;
+	float maxPushSpeed;
+	b3Softness softness;
 } b3ManifoldConstraint;
 
 typedef struct b3ContactConstraint
@@ -46,7 +48,6 @@ typedef struct b3ContactConstraint
 	int indexB;
 	float invMassA, invMassB;
 	b3Matrix3 invIA, invIB;
-	b3Softness softness;
 	b3Matrix3 rollingMass;
 	float friction;
 	float restitution;

@@ -186,6 +186,7 @@ typedef struct b3StepContext
 
 	int subStepCount;
 
+	float contactHertz;
 	b3Softness contactSoftness;
 	b3Softness staticSoftness;
 
@@ -275,6 +276,19 @@ static inline b3Softness b3MakeSoft( float hertz, float zeta, float h )
 	float omega = 2.0f * B3_PI * hertz;
 	float a1 = 2.0f * zeta + h * omega;
 	float a2 = h * omega * a1;
+	if ( !isfinite( a2 ) )
+	{
+		// Finite damping can overflow the float intermediates. Keep ordinary rounding unchanged.
+		double omegaWide = 2.0 * B3_PI * hertz;
+		double a1Wide = 2.0 * zeta + h * omegaWide;
+		double a2Wide = h * omegaWide * a1Wide;
+		double a3Wide = 1.0 / ( 1.0 + a2Wide );
+		return ( b3Softness ){
+			.biasRate = (float)( omegaWide / a1Wide ),
+			.massScale = (float)( a2Wide * a3Wide ),
+			.impulseScale = (float)a3Wide,
+		};
+	}
 	float a3 = 1.0f / ( 1.0f + a2 );
 
 	// bias = w / (2 * z + hw)

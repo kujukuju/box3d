@@ -364,7 +364,27 @@ static bool b3ContinuousPreSolveCandidate( const b3TOIOutput* output, int childI
 		.triangleIndexB = B3_NULL_INDEX,
 	};
 
-	// Continuous collision has no solver manifold. The callback can only reject this candidate.
+	// Contact storage is stable here: narrow phase and constraint solving have finished.
+	const b3Body* fastBody = b3Array_Get( world->bodies, shapeB->bodyId );
+	int contactKey = fastBody->headContactKey;
+	while ( contactKey != B3_NULL_INDEX )
+	{
+		const b3Contact* contact = b3Array_Get( world->contacts, contactKey >> 1 );
+		int edgeIndex = contactKey & 1;
+		contactKey = contact->edges[edgeIndex].nextKey;
+
+		bool samePair = ( contact->shapeIdA == shapeA->id && contact->shapeIdB == shapeB->id ) ||
+						( contact->shapeIdA == shapeB->id && contact->shapeIdB == shapeA->id );
+		if ( samePair && ( shapeA->type != b3_compoundShape || contact->childIndex == childIndex ) &&
+			 ( contact->flags & b3_contactTouchingFlag ) != 0 && contact->manifoldCount > 0 &&
+			 contact->preSolveStepIndex == world->stepIndex )
+		{
+			data.contactId = (b3ContactId){ contact->contactId + 1, world->worldId, 0, contact->generation };
+			break;
+		}
+	}
+
+	// There is no mutable solver manifold for this candidate. The callback can only reject it.
 	return world->preSolveFcn( shapeIdA, shapeIdB, &data, world->preSolveContext );
 }
 
@@ -1468,9 +1488,6 @@ static void b3BulletBodyTask( int startIndex, int endIndex, int workerIndex, voi
 // Solve with graph coloring
 void b3Solve( b3World* world, b3StepContext* stepContext )
 {
-	// Only count steps that advance the simulation
-	world->stepIndex += 1;
-
 	b3SolverSet* awakeSet = b3Array_Get( world->solverSets, b3_awakeSet );
 	int awakeBodyCount = awakeSet->bodySims.count;
 	if ( awakeBodyCount == 0 )

@@ -636,6 +636,577 @@ static int CheckCappedContact( b3BodyId bodyId, float maxNormalImpulse )
 	return 0;
 }
 
+// Equality checks alone do not reject NaNs. Check both body state and the stored solver caches.
+static int CheckFiniteContactBody( b3BodyId bodyId )
+{
+	ENSURE( b3IsValidWorldTransform( b3Body_GetTransform( bodyId ) ) );
+	ENSURE( b3IsValidVec3( b3Body_GetLinearVelocity( bodyId ) ) );
+	ENSURE( b3IsValidVec3( b3Body_GetAngularVelocity( bodyId ) ) );
+	b3ContactData contacts[64];
+	ENSURE( b3Body_GetContactCapacity( bodyId ) <= ARRAY_COUNT( contacts ) );
+	int count = b3Body_GetContactData( bodyId, contacts, ARRAY_COUNT( contacts ) );
+	for ( int i = 0; i < count; ++i )
+	{
+		for ( int j = 0; j < contacts[i].manifoldCount; ++j )
+		{
+			const b3Manifold* manifold = contacts[i].manifolds + j;
+			ENSURE( b3IsValidVec3( manifold->normal ) );
+			ENSURE( b3IsValidVec3( manifold->frictionImpulse ) );
+			ENSURE( b3IsValidVec3( manifold->rollingImpulse ) );
+			ENSURE( b3IsValidFloat( manifold->twistImpulse ) );
+			ENSURE( b3IsValidFloat( manifold->maxPushSpeed ) );
+			ENSURE( b3IsValidFloat( manifold->contactDampingRatio ) );
+			for ( int k = 0; k < manifold->pointCount; ++k )
+			{
+				const b3ManifoldPoint* point = manifold->points + k;
+				ENSURE( b3IsValidVec3( point->anchorA ) && b3IsValidVec3( point->anchorB ) );
+				ENSURE( b3IsValidFloat( point->separation ) );
+				ENSURE( b3IsValidFloat( point->normalImpulse ) );
+				ENSURE( b3IsValidFloat( point->totalNormalImpulse ) );
+				ENSURE( b3IsValidFloat( point->normalVelocity ) );
+			}
+		}
+	}
+	return 0;
+}
+
+typedef struct PushSpeedOverride
+{
+	b3ShapeId shapeId;
+	float defaultSpeed;
+	float overrideSpeed;
+	int callCount;
+	bool overrideEnabled;
+	bool defaultsValid;
+} PushSpeedOverride;
+
+static bool OverrideManifoldPushSpeed( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	if ( data->phase != b3_preSolveDiscrete )
+	{
+		return true;
+	}
+
+	PushSpeedOverride* override = context;
+	override->callCount += 1;
+	bool selected = B3_ID_EQUALS( shapeIdA, override->shapeId ) || B3_ID_EQUALS( shapeIdB, override->shapeId );
+	for ( int i = 0; i < data->manifoldCount; ++i )
+	{
+		b3Manifold* manifold = data->manifolds + i;
+		override->defaultsValid = override->defaultsValid && manifold->maxPushSpeed == override->defaultSpeed;
+		if ( selected && override->overrideEnabled )
+		{
+			manifold->maxPushSpeed = override->overrideSpeed;
+		}
+	}
+	return true;
+}
+
+static int TestPreSolveMaxPushSpeed( void )
+{
+	const float speeds[] = { 0.0f, 6.0f, FLT_MAX };
+	for ( int meshIndex = 0; meshIndex < 2; ++meshIndex )
+	{
+		b3MeshData* mesh = meshIndex != 0 ? b3CreateGridMesh( 4, 4, 2.0f, 0, true ) : NULL;
+		ENSURE( meshIndex == 0 || mesh != NULL );
+		float firstStepY[ARRAY_COUNT( speeds )];
+
+		for ( int speedIndex = 0; speedIndex < ARRAY_COUNT( speeds ); ++speedIndex )
+		{
+			b3WorldId worlds[2];
+			b3BodyId spheres[2][3];
+			PushSpeedOverride overrides[2] = { 0 };
+			b3WorldDef worldDef = b3DefaultWorldDef();
+			worldDef.gravity = b3Vec3_zero;
+			worldDef.workerCount = 1;
+			worldDef.enableContinuous = false;
+			worldDef.enableSleep = false;
+
+			for ( int worldIndex = 0; worldIndex < 2; ++worldIndex )
+			{
+				// Compare a local override against the same cap applied to the whole world.
+				worldDef.contactSpeed = worldIndex == 0 ? 3.0f : speeds[speedIndex];
+				b3WorldId worldId = b3CreateWorld( &worldDef );
+				worlds[worldIndex] = worldId;
+				b3World_SetContactRecycleDistance( worldId, 1.0f );
+				PushSpeedOverride* override = overrides + worldIndex;
+				override->defaultSpeed = worldDef.contactSpeed;
+				override->overrideSpeed = speeds[speedIndex];
+				override->overrideEnabled = worldIndex == 0;
+				override->defaultsValid = true;
+				b3World_SetPreSolveCallback( worldId, OverrideManifoldPushSpeed, override );
+
+				b3BodyDef bodyDef = b3DefaultBodyDef();
+				bodyDef.position.y = mesh == NULL ? -0.5f : 0.0f;
+				b3BodyId groundId = b3CreateBody( worldId, &bodyDef );
+				b3ShapeDef shapeDef = b3DefaultShapeDef();
+				shapeDef.baseMaterial.friction = 0.0f;
+				if ( mesh != NULL )
+				{
+					b3CreateMeshShape( groundId, &shapeDef, mesh, b3Vec3_one );
+				}
+				else
+				{
+					b3BoxHull ground = b3MakeBoxHull( 6.0f, 0.5f, 6.0f );
+					b3CreateHullShape( groundId, &shapeDef, &ground.base );
+				}
+
+				for ( int bodyIndex = 0; bodyIndex < 3; ++bodyIndex )
+				{
+					bodyDef = b3DefaultBodyDef();
+					bodyDef.type = b3_dynamicBody;
+					bodyDef.position = (b3Pos){ -2.0f + 2.0f * bodyIndex, 0.1f, 0.0f };
+					bodyDef.linearVelocity = (b3Vec3){ 1.0f, 0.0f, 0.0f };
+					bodyDef.motionLocks.angularX = true;
+					bodyDef.motionLocks.angularY = true;
+					bodyDef.motionLocks.angularZ = true;
+					b3BodyId bodyId = b3CreateBody( worldId, &bodyDef );
+					spheres[worldIndex][bodyIndex] = bodyId;
+					b3Body_EnableContactRecycling( bodyId, true );
+					shapeDef = b3DefaultShapeDef();
+					shapeDef.density = 1.0f;
+					shapeDef.baseMaterial.friction = 0.0f;
+					// Body 0 is selected, body 1 is ordinary, and body 2 gets a no-op callback.
+					shapeDef.enablePreSolveEvents = bodyIndex != 1;
+					b3Sphere sphere = { b3Vec3_zero, 0.5f };
+					b3ShapeId shapeId = b3CreateSphereShape( bodyId, &shapeDef, &sphere );
+					if ( bodyIndex == 0 )
+					{
+						override->shapeId = shapeId;
+					}
+				}
+				b3World_Step( worldId, 1.0f / 60.0f, 4 );
+				ENSURE( override->callCount >= 2 );
+				ENSURE( override->defaultsValid );
+				for ( int bodyIndex = 0; bodyIndex < 3; ++bodyIndex )
+				{
+					ENSURE( CheckFiniteContactBody( spheres[worldIndex][bodyIndex] ) == 0 );
+				}
+			}
+
+			float localY = b3Body_GetPosition( spheres[0][0] ).y;
+			float globalY = b3Body_GetPosition( spheres[1][0] ).y;
+			float ordinaryY = b3Body_GetPosition( spheres[0][1] ).y;
+			firstStepY[speedIndex] = localY;
+			ENSURE_SMALL( localY - globalY, 1.0e-5f );
+			ENSURE_SMALL( ordinaryY - b3Body_GetPosition( spheres[0][2] ).y, 1.0e-5f );
+			ENSURE( ordinaryY > 0.14f && ordinaryY < 0.16f );
+			if ( speeds[speedIndex] == 0.0f )
+			{
+				ENSURE_SMALL( localY - 0.1f, 1.0e-6f );
+			}
+			else if ( speeds[speedIndex] == 6.0f )
+			{
+				// This cap binds: recovery is below 6 * dt, but clearly above the ordinary 3 m/s cap.
+				ENSURE( localY > ordinaryY + 0.035f );
+				ENSURE( localY > 0.18f && localY <= 0.20001f );
+			}
+			else
+			{
+				ENSURE( localY > ordinaryY + 0.05f );
+			}
+			ENSURE_SMALL( b3Body_GetLinearVelocity( spheres[0][0] ).x - 1.0f, 1.0e-6f );
+
+			// The override must reset on the next update. Ordinary recycled contacts must use the new world cap.
+			overrides[0].overrideEnabled = false;
+			overrides[1].defaultSpeed = 3.0f;
+			b3World_SetContactTuning( worlds[1], worldDef.contactHertz, worldDef.contactDampingRatio, 3.0f );
+			for ( int worldIndex = 0; worldIndex < 2; ++worldIndex )
+			{
+				overrides[worldIndex].callCount = 0;
+				b3World_Step( worlds[worldIndex], 1.0f / 60.0f, 4 );
+				ENSURE( overrides[worldIndex].callCount >= 2 );
+				ENSURE( overrides[worldIndex].defaultsValid );
+				ENSURE( b3World_GetCounters( worlds[worldIndex] ).recycledContactCount > 0 );
+				for ( int bodyIndex = 0; bodyIndex < 3; ++bodyIndex )
+				{
+					ENSURE( CheckFiniteContactBody( spheres[worldIndex][bodyIndex] ) == 0 );
+				}
+				ENSURE_SMALL( b3Body_GetPosition( spheres[worldIndex][1] ).y -
+							  b3Body_GetPosition( spheres[worldIndex][2] ).y, 1.0e-5f );
+			}
+			ENSURE_SMALL( b3Body_GetPosition( spheres[0][0] ).y - b3Body_GetPosition( spheres[1][0] ).y, 1.0e-5f );
+
+			b3DestroyWorld( worlds[0] );
+			b3DestroyWorld( worlds[1] );
+		}
+		// Independent of local/global agreement: ignoring the positive override cannot pass this check.
+		ENSURE( firstStepY[2] > firstStepY[1] + 0.02f );
+		if ( mesh != NULL )
+		{
+			b3DestroyMesh( mesh );
+		}
+	}
+	return 0;
+}
+
+typedef struct DampingRatioOverride
+{
+	b3ShapeId shapeId;
+	float ratio;
+	int callCount;
+	bool defaultsValid;
+	bool verticalOnly;
+} DampingRatioOverride;
+
+static bool OverrideManifoldDampingRatio( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	if ( data->phase != b3_preSolveDiscrete )
+	{
+		return true;
+	}
+
+	DampingRatioOverride* override = context;
+	override->callCount += 1;
+	bool selected = B3_ID_EQUALS( shapeIdA, override->shapeId ) || B3_ID_EQUALS( shapeIdB, override->shapeId );
+	for ( int i = 0; i < data->manifoldCount; ++i )
+	{
+		b3Manifold* manifold = data->manifolds + i;
+		override->defaultsValid = override->defaultsValid && manifold->contactDampingRatio == -1.0f;
+		if ( selected && ( override->verticalOnly == false || b3AbsFloat( manifold->normal.y ) > 0.99f ) )
+		{
+			manifold->contactDampingRatio = override->ratio;
+		}
+	}
+	return true;
+}
+
+static int TestPreSolveContactDampingRatio( void )
+{
+	const int subSteps[] = { 1, 4, 8 };
+	const float ratios[] = { 0.0f, 1.0f, FLT_MAX };
+	// Static convex (SIMD), static mesh (scalar), and dynamic-dynamic convex softness.
+	for ( int scene = 0; scene < 3; ++scene )
+	{
+		b3MeshData* mesh = scene == 1 ? b3CreateGridMesh( 4, 4, 2.0f, 0, true ) : NULL;
+		ENSURE( scene != 1 || mesh != NULL );
+		for ( int subStepIndex = 0; subStepIndex < ARRAY_COUNT( subSteps ); ++subStepIndex )
+		{
+			for ( int ratioIndex = 0; ratioIndex < ARRAY_COUNT( ratios ); ++ratioIndex )
+			{
+				b3WorldId worlds[3];
+				b3BodyId spheres[3][3];
+				DampingRatioOverride overrides[2] = { 0 };
+				b3WorldDef worldDef = b3DefaultWorldDef();
+				worldDef.gravity = b3Vec3_zero;
+				worldDef.workerCount = 1;
+				worldDef.enableContinuous = false;
+				worldDef.enableSleep = false;
+				worldDef.contactSpeed = FLT_MAX;
+				float defaultRatio = worldDef.contactDampingRatio;
+
+				for ( int worldIndex = 0; worldIndex < 3; ++worldIndex )
+				{
+					// Local override, equivalent global tuning, and an untouched default world.
+					worldDef.contactDampingRatio = worldIndex == 1 ? ratios[ratioIndex] : defaultRatio;
+					b3WorldId worldId = b3CreateWorld( &worldDef );
+					worlds[worldIndex] = worldId;
+					b3World_SetContactRecycleDistance( worldId, 1.0f );
+					if ( worldIndex < 2 )
+					{
+						overrides[worldIndex].ratio = worldIndex == 0 ? ratios[ratioIndex] : -1.0f;
+						overrides[worldIndex].defaultsValid = true;
+						b3World_SetPreSolveCallback( worldId, OverrideManifoldDampingRatio, overrides + worldIndex );
+					}
+
+					for ( int bodyIndex = 0; bodyIndex < 3; ++bodyIndex )
+					{
+						b3BodyDef bodyDef = b3DefaultBodyDef();
+						bodyDef.type = scene == 2 ? b3_dynamicBody : b3_staticBody;
+						bodyDef.position = (b3Pos){ -3.0f + 3.0f * bodyIndex, mesh == NULL ? -0.5f : 0.0f, 0.0f };
+						bodyDef.motionLocks.angularX = true;
+						bodyDef.motionLocks.angularY = true;
+						bodyDef.motionLocks.angularZ = true;
+						b3BodyId groundId = b3CreateBody( worldId, &bodyDef );
+						b3ShapeDef shapeDef = b3DefaultShapeDef();
+						shapeDef.baseMaterial.friction = 0.0f;
+						if ( mesh != NULL )
+						{
+							b3CreateMeshShape( groundId, &shapeDef, mesh, (b3Vec3){ 0.2f, 1.0f, 0.2f } );
+						}
+						else
+						{
+							b3BoxHull ground = b3MakeBoxHull( 0.75f, 0.5f, 0.75f );
+							b3CreateHullShape( groundId, &shapeDef, &ground.base );
+						}
+
+						bodyDef.type = b3_dynamicBody;
+						bodyDef.position.y = 0.3f;
+						b3BodyId sphereId = b3CreateBody( worldId, &bodyDef );
+						spheres[worldIndex][bodyIndex] = sphereId;
+						b3Body_EnableContactRecycling( sphereId, true );
+						// Selected, ordinary (recyclable), and no-op callback contacts.
+						shapeDef.enablePreSolveEvents = bodyIndex != 1;
+						b3Sphere sphere = { b3Vec3_zero, 0.5f };
+						b3ShapeId shapeId = b3CreateSphereShape( sphereId, &shapeDef, &sphere );
+						if ( worldIndex < 2 && bodyIndex == 0 )
+						{
+							overrides[worldIndex].shapeId = shapeId;
+						}
+					}
+				}
+
+				for ( int step = 0; step < 3; ++step )
+				{
+					if ( step == 1 )
+					{
+						// Both selected contacts now use defaults; stale local damping must not survive.
+						overrides[0].ratio = -1.0f;
+						b3World_SetContactTuning( worlds[1], worldDef.contactHertz, defaultRatio, worldDef.contactSpeed );
+					}
+					for ( int worldIndex = 0; worldIndex < 3; ++worldIndex )
+					{
+						if ( worldIndex < 2 )
+						{
+							overrides[worldIndex].callCount = 0;
+						}
+						b3World_Step( worlds[worldIndex], 1.0f / 60.0f, subSteps[subStepIndex] );
+						for ( int bodyIndex = 0; bodyIndex < 3; ++bodyIndex )
+						{
+							ENSURE( CheckFiniteContactBody( spheres[worldIndex][bodyIndex] ) == 0 );
+						}
+						if ( worldIndex < 2 )
+						{
+							ENSURE( overrides[worldIndex].defaultsValid );
+							ENSURE( overrides[worldIndex].callCount >= 2 );
+						}
+					}
+
+					ENSURE_SMALL( b3Body_GetPosition( spheres[0][0] ).y - b3Body_GetPosition( spheres[1][0] ).y, 1.0e-6f );
+					ENSURE_SMALL( b3Body_GetLinearVelocity( spheres[0][0] ).y -
+								  b3Body_GetLinearVelocity( spheres[1][0] ).y, 1.0e-6f );
+					if ( step == 0 )
+					{
+						if ( ratios[ratioIndex] == FLT_MAX )
+						{
+							ENSURE( b3Body_GetPosition( spheres[0][0] ).y < b3Body_GetPosition( spheres[2][0] ).y - 0.001f );
+						}
+						else
+						{
+							ENSURE( b3Body_GetPosition( spheres[0][0] ).y > b3Body_GetPosition( spheres[2][0] ).y + 0.01f );
+						}
+					}
+					else
+					{
+						ENSURE( b3World_GetCounters( worlds[0] ).recycledContactCount > 0 );
+					}
+					for ( int bodyIndex = 1; bodyIndex < 3; ++bodyIndex )
+					{
+						b3Pos localPosition = b3Body_GetPosition( spheres[0][bodyIndex] );
+						b3Pos defaultPosition = b3Body_GetPosition( spheres[2][bodyIndex] );
+						b3Vec3 localVelocity = b3Body_GetLinearVelocity( spheres[0][bodyIndex] );
+						b3Vec3 defaultVelocity = b3Body_GetLinearVelocity( spheres[2][bodyIndex] );
+						ENSURE( memcmp( &localPosition, &defaultPosition, sizeof( localPosition ) ) == 0 );
+						ENSURE( memcmp( &localVelocity, &defaultVelocity, sizeof( localVelocity ) ) == 0 );
+					}
+				}
+
+				for ( int worldIndex = 0; worldIndex < 3; ++worldIndex )
+				{
+					b3DestroyWorld( worlds[worldIndex] );
+				}
+			}
+		}
+		if ( mesh != NULL )
+		{
+			b3DestroyMesh( mesh );
+		}
+	}
+	return 0;
+}
+
+static int TestPreSolveDampingManifoldIsolation( void )
+{
+	b3MeshData* mesh = b3CreateHollowBoxMesh( b3Vec3_zero, b3Vec3_one );
+	ENSURE( mesh != NULL );
+	b3Pos positions[3];
+	for ( int worldIndex = 0; worldIndex < 3; ++worldIndex )
+	{
+		b3WorldDef worldDef = b3DefaultWorldDef();
+		worldDef.gravity = b3Vec3_zero;
+		worldDef.workerCount = 1;
+		worldDef.enableContinuous = false;
+		worldDef.contactSpeed = FLT_MAX;
+		if ( worldIndex == 1 )
+		{
+			worldDef.contactDampingRatio = 1.0f;
+		}
+		b3WorldId worldId = b3CreateWorld( &worldDef );
+
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		b3BodyId meshId = b3CreateBody( worldId, &bodyDef );
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.baseMaterial.friction = 0.0f;
+		b3CreateMeshShape( meshId, &shapeDef, mesh, b3Vec3_one );
+
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position = (b3Pos){ 0.7f, 0.7f, 0.0f };
+		bodyDef.motionLocks.angularX = true;
+		bodyDef.motionLocks.angularY = true;
+		bodyDef.motionLocks.angularZ = true;
+		b3BodyId sphereId = b3CreateBody( worldId, &bodyDef );
+		shapeDef.enablePreSolveEvents = true;
+		b3Sphere sphere = { b3Vec3_zero, 0.5f };
+		b3ShapeId shapeId = b3CreateSphereShape( sphereId, &shapeDef, &sphere );
+		DampingRatioOverride override = {
+			.shapeId = shapeId,
+			.ratio = 1.0f,
+			.defaultsValid = true,
+			.verticalOnly = true,
+		};
+		if ( worldIndex == 0 )
+		{
+			b3World_SetPreSolveCallback( worldId, OverrideManifoldDampingRatio, &override );
+		}
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		positions[worldIndex] = b3Body_GetPosition( sphereId );
+		ENSURE( CheckFiniteContactBody( sphereId ) == 0 );
+
+		b3ContactData contacts[1];
+		ENSURE( b3Body_GetContactData( sphereId, contacts, ARRAY_COUNT( contacts ) ) == 1 );
+		ENSURE( contacts[0].manifoldCount == 2 );
+		if ( worldIndex == 0 )
+		{
+			ENSURE( override.callCount == 1 && override.defaultsValid );
+			for ( int i = 0; i < contacts[0].manifoldCount; ++i )
+			{
+				const b3Manifold* manifold = contacts[0].manifolds + i;
+				float expected = b3AbsFloat( manifold->normal.y ) > 0.99f ? 1.0f : -1.0f;
+				ENSURE( manifold->contactDampingRatio == expected );
+			}
+		}
+		b3DestroyWorld( worldId );
+	}
+	b3DestroyMesh( mesh );
+
+	// One contact, two perpendicular manifolds: local Y damping must not retune X.
+	ENSURE_SMALL( positions[0].y - positions[1].y, 1.0e-6f );
+	ENSURE_SMALL( positions[0].x - positions[2].x, 1.0e-6f );
+	ENSURE( positions[0].y < positions[2].y - 0.01f );
+	ENSURE( positions[1].x < positions[0].x - 0.01f );
+	return 0;
+}
+
+typedef struct ContactTuningCapture
+{
+	float defaultSpeed;
+	float maxPushSpeed;
+	float dampingRatio;
+	int callCount;
+	int loadedCount;
+	bool defaultsValid;
+} ContactTuningCapture;
+
+static bool OverrideContactTuning( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	(void)shapeIdA;
+	(void)shapeIdB;
+	if ( data->phase != b3_preSolveDiscrete )
+	{
+		return true;
+	}
+	ContactTuningCapture* capture = context;
+	capture->callCount += 1;
+	for ( int i = 0; i < data->manifoldCount; ++i )
+	{
+		b3Manifold* manifold = data->manifolds + i;
+		capture->defaultsValid = capture->defaultsValid && manifold->maxPushSpeed == capture->defaultSpeed &&
+								 manifold->contactDampingRatio == -1.0f;
+		manifold->maxPushSpeed = capture->maxPushSpeed;
+		manifold->contactDampingRatio = capture->dampingRatio;
+		for ( int j = 0; j < manifold->pointCount; ++j )
+		{
+			const b3ManifoldPoint* point = manifold->points + j;
+			if ( point->persisted && point->normalImpulse > 0.0f )
+			{
+				capture->loadedCount += 1;
+			}
+		}
+	}
+	return true;
+}
+
+static int TestPreSolveLoadedTuningTransitions( void )
+{
+	const float speeds[] = { 6.0f, 0.0f, FLT_MAX, 3.0f };
+	const float ratios[] = { 1.0f, 0.0f, FLT_MAX, -1.0f };
+	for ( int meshIndex = 0; meshIndex < 2; ++meshIndex )
+	{
+		b3MeshData* mesh = meshIndex != 0 ? b3CreateGridMesh( 4, 4, 2.0f, 0, true ) : NULL;
+		ENSURE( meshIndex == 0 || mesh != NULL );
+		b3WorldId worlds[2];
+		b3BodyId spheres[2];
+		ContactTuningCapture captures[2] = { 0 };
+		b3WorldDef worldDef = b3DefaultWorldDef();
+		worldDef.workerCount = 1;
+		worldDef.enableSleep = false;
+		worldDef.enableContinuous = false;
+		for ( int worldIndex = 0; worldIndex < 2; ++worldIndex )
+		{
+			b3WorldId worldId = b3CreateWorld( &worldDef );
+			worlds[worldIndex] = worldId;
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.position.y = mesh == NULL ? -0.5f : 0.0f;
+			b3BodyId groundId = b3CreateBody( worldId, &bodyDef );
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			if ( mesh != NULL )
+			{
+				b3CreateMeshShape( groundId, &shapeDef, mesh, b3Vec3_one );
+			}
+			else
+			{
+				b3BoxHull ground = b3MakeBoxHull( 4.0f, 0.5f, 4.0f );
+				b3CreateHullShape( groundId, &shapeDef, &ground.base );
+			}
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position = (b3Pos){ 0.0f, 0.49f, 0.0f };
+			spheres[worldIndex] = b3CreateBody( worldId, &bodyDef );
+			shapeDef.enablePreSolveEvents = true;
+			b3Sphere sphere = { b3Vec3_zero, 0.5f };
+			b3CreateSphereShape( spheres[worldIndex], &shapeDef, &sphere );
+			for ( int step = 0; step < 60; ++step )
+			{
+				b3World_Step( worldId, 1.0f / 60.0f, 4 );
+			}
+			captures[worldIndex].defaultsValid = true;
+			b3World_SetPreSolveCallback( worldId, OverrideContactTuning, captures + worldIndex );
+		}
+
+		for ( int phase = 0; phase < ARRAY_COUNT( speeds ); ++phase )
+		{
+			// No teleport or cache reset: switch a resting, gravity-loaded contact to new tuning and back to defaults.
+			for ( int worldIndex = 0; worldIndex < 2; ++worldIndex )
+			{
+				ContactTuningCapture* capture = captures + worldIndex;
+				capture->defaultSpeed = worldIndex == 0 ? worldDef.contactSpeed : speeds[phase];
+				capture->maxPushSpeed = speeds[phase];
+				capture->dampingRatio = worldIndex == 0 ? ratios[phase] : -1.0f;
+				capture->callCount = 0;
+				capture->loadedCount = 0;
+				float ratio = ratios[phase] < 0.0f ? worldDef.contactDampingRatio : ratios[phase];
+				if ( worldIndex == 1 )
+				{
+					b3World_SetContactTuning( worlds[worldIndex], worldDef.contactHertz, ratio, speeds[phase] );
+				}
+				b3World_Step( worlds[worldIndex], 1.0f / 60.0f, 4 );
+				ENSURE( capture->callCount == 1 && capture->loadedCount > 0 && capture->defaultsValid );
+				ENSURE( CheckFiniteContactBody( spheres[worldIndex] ) == 0 );
+			}
+			b3Vec3 deltaPosition = b3SubPos( b3Body_GetPosition( spheres[0] ), b3Body_GetPosition( spheres[1] ) );
+			b3Vec3 deltaVelocity = b3Sub( b3Body_GetLinearVelocity( spheres[0] ), b3Body_GetLinearVelocity( spheres[1] ) );
+			ENSURE_SMALL( b3Length( deltaPosition ), 1.0e-6f );
+			ENSURE_SMALL( b3Length( deltaVelocity ), 1.0e-6f );
+		}
+		b3DestroyWorld( worlds[0] );
+		b3DestroyWorld( worlds[1] );
+		if ( mesh != NULL )
+		{
+			b3DestroyMesh( mesh );
+		}
+	}
+	return 0;
+}
+
 static int TestPreSolveMaxNormalImpulse( void )
 {
 	const float maxNormalImpulse = 0.05f;
@@ -941,10 +1512,14 @@ static int TestPreSolveNoOpPreservesWarmStart( void )
 	int callCount = 0;
 
 	// Contact recycling is disabled inside the helper for both worlds so this isolates callback warm starting.
-	ENSURE( RunPreSolveContact( false, false, NULL, NULL, &ordinaryState ) == 0 );
-	ENSURE( RunPreSolveContact( false, true, ObservePreSolveContact, &callCount, &observedState ) == 0 );
-	ENSURE( callCount > 1 );
-	ENSURE( NullPreSolveContactStatesEqual( &ordinaryState, &observedState ) );
+	for ( int meshIndex = 0; meshIndex < 2; ++meshIndex )
+	{
+		callCount = 0;
+		ENSURE( RunPreSolveContact( meshIndex != 0, false, NULL, NULL, &ordinaryState ) == 0 );
+		ENSURE( RunPreSolveContact( meshIndex != 0, true, ObservePreSolveContact, &callCount, &observedState ) == 0 );
+		ENSURE( callCount > 1 );
+		ENSURE( memcmp( &ordinaryState, &observedState, sizeof( ordinaryState ) ) == 0 );
+	}
 	return 0;
 }
 
@@ -2063,6 +2638,96 @@ static int TestSetWorkerCount( void )
 	return 0;
 }
 
+static int TestPreSolveOverflowTuning( void )
+{
+	b3WorldId worlds[3];
+	b3BodyId bodies[3][32];
+	int bodyCounts[3] = { 0 };
+	ContactTuningCapture capture = {
+		.defaultSpeed = 3.0f,
+		.maxPushSpeed = 0.03f,
+		.dampingRatio = 1.0f,
+		.defaultsValid = true,
+	};
+	for ( int worldIndex = 0; worldIndex < 3; ++worldIndex )
+	{
+		b3WorldDef worldDef = b3DefaultWorldDef();
+		worldDef.workerCount = 1;
+		worldDef.enableContinuous = false;
+		worldDef.enableSleep = false;
+		if ( worldIndex == 1 )
+		{
+			worldDef.contactSpeed = capture.maxPushSpeed;
+			worldDef.contactDampingRatio = capture.dampingRatio;
+		}
+		worlds[worldIndex] = b3CreateWorld( &worldDef );
+		OverflowColorPileData pile = CreateOverflowColorPile( worlds[worldIndex] );
+		b3World_Step( worlds[worldIndex], 0.0f, 1 );
+		bodies[worldIndex][0] = pile.hubId;
+		bodyCounts[worldIndex] = 1;
+		b3ContactData contacts[32];
+		ENSURE( b3Body_GetContactCapacity( pile.hubId ) <= ARRAY_COUNT( contacts ) );
+		int contactCount = b3Body_GetContactData( pile.hubId, contacts, ARRAY_COUNT( contacts ) );
+		for ( int i = 0; i < contactCount; ++i )
+		{
+			b3ShapeId shapes[2] = { contacts[i].shapeIdA, contacts[i].shapeIdB };
+			for ( int j = 0; j < 2; ++j )
+			{
+				// Opt in every pile shape, including ordinary colored and overflow contacts.
+				b3Shape_EnablePreSolveEvents( shapes[j], true );
+				b3BodyId bodyId = b3Shape_GetBody( shapes[j] );
+				if ( b3Body_GetType( bodyId ) != b3_dynamicBody || B3_ID_EQUALS( bodyId, pile.hubId ) )
+				{
+					continue;
+				}
+				ENSURE( bodyCounts[worldIndex] < ARRAY_COUNT( bodies[worldIndex] ) );
+				bodies[worldIndex][bodyCounts[worldIndex]++] = bodyId;
+			}
+		}
+		ENSURE( bodyCounts[worldIndex] == pile.neighborCount + 1 );
+		b3Shape_EnablePreSolveEvents( pile.groundShapeId, true );
+		if ( worldIndex == 0 )
+		{
+			b3World_SetPreSolveCallback( worlds[worldIndex], OverrideContactTuning, &capture );
+		}
+	}
+
+	for ( int step = 0; step < 4; ++step )
+	{
+		capture.callCount = 0;
+		capture.loadedCount = 0;
+		for ( int worldIndex = 0; worldIndex < 3; ++worldIndex )
+		{
+			b3World_Step( worlds[worldIndex], 1.0f / 60.0f, 4 );
+			ENSURE( b3World_GetCounters( worlds[worldIndex] ).colorCounts[B3_GRAPH_COLOR_COUNT - 1] > 0 );
+			for ( int i = 0; i < bodyCounts[worldIndex]; ++i )
+			{
+				ENSURE( CheckFiniteContactBody( bodies[worldIndex][i] ) == 0 );
+			}
+		}
+		ENSURE( capture.callCount > B3_GRAPH_COLOR_COUNT && capture.defaultsValid );
+		if ( step > 0 )
+		{
+			ENSURE( capture.loadedCount > 0 );
+		}
+		float effect = 0.0f;
+		for ( int i = 0; i < bodyCounts[0]; ++i )
+		{
+			b3Pos localPosition = b3Body_GetPosition( bodies[0][i] );
+			ENSURE_SMALL( b3Length( b3SubPos( localPosition, b3Body_GetPosition( bodies[1][i] ) ) ), 1.0e-6f );
+			ENSURE_SMALL( b3Length( b3Sub( b3Body_GetLinearVelocity( bodies[0][i] ),
+									 b3Body_GetLinearVelocity( bodies[1][i] ) ) ), 1.0e-6f );
+			effect += b3Length( b3SubPos( localPosition, b3Body_GetPosition( bodies[2][i] ) ) );
+		}
+		ENSURE( effect > 1.0e-4f );
+	}
+	for ( int worldIndex = 0; worldIndex < 3; ++worldIndex )
+	{
+		b3DestroyWorld( worlds[worldIndex] );
+	}
+	return 0;
+}
+
 // Verifies the b3*_Overflow solver path. The scene puts >B3_DYNAMIC_COLOR_COUNT
 // dyn-dyn contacts on a single hub body so several land in the overflow color.
 // The new Prepare/Store contactId-pairing asserts in contact_solver.c fire here
@@ -2373,7 +3038,7 @@ static bool RejectContinuousPreSolve( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3
 	{
 		capture->continuousCount += 1;
 		capture->dataValid = capture->dataValid && data->manifolds == NULL && data->manifoldCount == 0 &&
-							 b3IsValidPosition( data->point ) && b3IsNormalized( data->normal ) && 0.0f < data->fraction &&
+							 B3_IS_NULL( data->contactId ) && b3IsValidPosition( data->point ) && b3IsNormalized( data->normal ) && 0.0f < data->fraction &&
 							 data->fraction < 1.0f;
 	}
 
@@ -2444,7 +3109,7 @@ static bool SelectLaterContinuousCandidate( b3ShapeId shapeIdA, b3ShapeId shapeI
 	capture->dataValid = capture->dataValid && B3_ID_EQUALS( shapeIdA, capture->staticShapeId ) &&
 						 B3_ID_EQUALS( shapeIdB, capture->sphereShapeId ) && data->childIndexA == capture->expectedChildIndex &&
 						 data->childIndexB == B3_NULL_INDEX && data->triangleIndexA != B3_NULL_INDEX &&
-						 data->triangleIndexB == B3_NULL_INDEX;
+						 data->triangleIndexB == B3_NULL_INDEX && B3_IS_NULL( data->contactId );
 
 	if ( data->point.x > 0.5f )
 	{
@@ -2550,6 +3215,579 @@ static int TestContinuousPreSolveAcceptsLaterTriangle( void )
 	return 0;
 }
 
+typedef struct ContinuousContactIdCapture
+{
+	b3ShapeId nearShapeId;
+	b3ShapeId farShapeId;
+	b3ShapeId sphereShapeId;
+	b3ContactId discreteContactId;
+	int nearChildIndex;
+	int farChildIndex;
+	int discreteCount;
+	int nearCount;
+	int farCount;
+	int discreteAction; // 0: accept, 1: reject, 2: disable all points
+	const void* continuousThread;
+	float marker;
+	float maxPushSpeed;
+	float contactDampingRatio;
+	bool farSharesContact;
+	bool expectFresh;
+	bool dataValid;
+} ContinuousContactIdCapture;
+
+static bool CheckContinuousContactId( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	ContinuousContactIdCapture* capture = context;
+	bool nearPair = B3_ID_EQUALS( shapeIdA, capture->nearShapeId ) && B3_ID_EQUALS( shapeIdB, capture->sphereShapeId );
+	bool farPair = B3_ID_EQUALS( shapeIdA, capture->farShapeId ) && B3_ID_EQUALS( shapeIdB, capture->sphereShapeId );
+	if ( nearPair == false && farPair == false )
+	{
+		return true;
+	}
+
+	if ( data->phase == b3_preSolveDiscrete )
+	{
+		capture->discreteCount += 1;
+		capture->dataValid = capture->dataValid && nearPair && data->childIndexA == capture->nearChildIndex &&
+							 b3Contact_IsValid( data->contactId );
+		capture->discreteContactId = data->contactId;
+		if ( b3Contact_IsValid( data->contactId ) == false )
+		{
+			return false;
+		}
+		b3ContactData contact = b3Contact_GetData( data->contactId );
+		capture->dataValid = capture->dataValid && B3_ID_EQUALS( contact.shapeIdA, shapeIdA ) &&
+							 B3_ID_EQUALS( contact.shapeIdB, shapeIdB ) && contact.manifolds == data->manifolds &&
+							 contact.manifoldCount == data->manifoldCount;
+		for ( int i = 0; i < data->manifoldCount; ++i )
+		{
+			b3Manifold* manifold = data->manifolds + i;
+			manifold->normal = (b3Vec3){ 0.0f, 1.0f, 0.0f };
+			manifold->maxPushSpeed = capture->maxPushSpeed;
+			manifold->contactDampingRatio = capture->contactDampingRatio;
+			for ( int j = 0; j < manifold->pointCount; ++j )
+			{
+				manifold->points[j].separation = -0.01f;
+				manifold->points[j].friction = 0.0f;
+				manifold->points[j].maxNormalImpulse = capture->marker;
+				manifold->points[j].enabled = capture->discreteAction != 2;
+			}
+		}
+		return capture->discreteAction != 1;
+	}
+
+	bool near = data->point.x > 0.5f;
+	if ( near )
+	{
+		capture->nearCount += 1;
+	}
+	else
+	{
+		capture->farCount += 1;
+	}
+	capture->dataValid = capture->dataValid && data->manifolds == NULL && data->manifoldCount == 0 &&
+						 data->childIndexA == ( near ? capture->nearChildIndex : capture->farChildIndex );
+	bool expectContact = capture->expectFresh && ( near || capture->farSharesContact );
+	if ( expectContact )
+	{
+		capture->dataValid = capture->dataValid && B3_ID_EQUALS( data->contactId, capture->discreteContactId ) &&
+							 b3Contact_IsValid( data->contactId );
+		if ( b3Contact_IsValid( data->contactId ) )
+		{
+			b3ContactData contact = b3Contact_GetData( data->contactId );
+			capture->dataValid = capture->dataValid && contact.manifoldCount > 0;
+			float totalImpulse = 0.0f;
+			for ( int i = 0; i < contact.manifoldCount; ++i )
+			{
+				const b3Manifold* manifold = contact.manifolds + i;
+				capture->dataValid = capture->dataValid && manifold->normal.y == 1.0f &&
+									 manifold->maxPushSpeed == capture->maxPushSpeed &&
+									 manifold->contactDampingRatio == capture->contactDampingRatio;
+				for ( int j = 0; j < manifold->pointCount; ++j )
+				{
+					const b3ManifoldPoint* point = manifold->points + j;
+					capture->dataValid = capture->dataValid && point->maxNormalImpulse == capture->marker &&
+										 b3IsValidFloat( point->normalImpulse ) && b3IsValidFloat( point->totalNormalImpulse );
+					totalImpulse += point->totalNormalImpulse;
+				}
+			}
+			capture->dataValid = capture->dataValid && b3IsValidFloat( totalImpulse ) && totalImpulse > 0.0f;
+		}
+	}
+	else
+	{
+		capture->dataValid = capture->dataValid && B3_IS_NULL( data->contactId );
+	}
+
+	// Reject only the near plane. Even a matching contact id does not authorize the far triangle.
+	return near == false;
+}
+
+static int TestContinuousPreSolveContactId( void )
+{
+	// One mesh contact, different shapes on the same body, and different children in one compound.
+	for ( int layout = 0; layout < 3; ++layout )
+	{
+		b3Vec3 vertices[8] = {
+			{ 1.0f, -5.0f, -5.0f }, { 1.0f, 5.0f, -5.0f }, { 1.0f, 5.0f, 5.0f }, { 1.0f, -5.0f, 5.0f },
+			{ 0.0f, -5.0f, -5.0f }, { 0.0f, 5.0f, -5.0f }, { 0.0f, 5.0f, 5.0f }, { 0.0f, -5.0f, 5.0f },
+		};
+		int32_t indices[12] = { 0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7 };
+		b3MeshDef meshDef = {
+			.vertices = vertices,
+			.indices = indices,
+			.vertexCount = layout == 0 ? 8 : 4,
+			.triangleCount = layout == 0 ? 4 : 2,
+		};
+		b3MeshData* nearMesh = b3CreateMesh( &meshDef, NULL, 0 );
+		ENSURE( nearMesh != NULL );
+		b3MeshData* farMesh = NULL;
+		if ( layout != 0 )
+		{
+			meshDef.vertices = vertices + 4;
+			farMesh = b3CreateMesh( &meshDef, NULL, 0 );
+			ENSURE( farMesh != NULL );
+		}
+
+		b3CompoundData* compound = NULL;
+		if ( layout == 2 )
+		{
+			b3SurfaceMaterial material = b3DefaultSurfaceMaterial();
+			b3CompoundMeshDef meshes[2] = {
+				{ .meshData = nearMesh, .transform = b3Transform_identity, .scale = b3Vec3_one,
+				  .materials = &material, .materialCount = 1 },
+				{ .meshData = farMesh, .transform = b3Transform_identity, .scale = b3Vec3_one,
+				  .materials = &material, .materialCount = 1 },
+			};
+			b3CompoundDef compoundDef = { .meshes = meshes, .meshCount = 2 };
+			compound = b3CreateCompound( &compoundDef );
+			ENSURE( compound != NULL );
+		}
+
+		b3WorldDef worldDef = b3DefaultWorldDef();
+		worldDef.gravity = b3Vec3_zero;
+		worldDef.workerCount = 1;
+		b3WorldId worldId = b3CreateWorld( &worldDef );
+		b3BodyDef bodyDef = b3DefaultBodyDef();
+		b3BodyId staticBodyId = b3CreateBody( worldId, &bodyDef );
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		b3ShapeId nearShapeId = layout == 2 ? b3CreateBakedCompoundShape( staticBodyId, &shapeDef, compound )
+										  : b3CreateMeshShape( staticBodyId, &shapeDef, nearMesh, b3Vec3_one );
+		b3ShapeId farShapeId = layout == 1 ? b3CreateMeshShape( staticBodyId, &shapeDef, farMesh, b3Vec3_one ) : nearShapeId;
+
+		bodyDef.type = b3_dynamicBody;
+		bodyDef.position = (b3Pos){ 1.255f, 0.0f, 0.0f };
+		b3BodyId sphereBodyId = b3CreateBody( worldId, &bodyDef );
+		shapeDef.enablePreSolveEvents = true;
+		b3Sphere sphere = { b3Vec3_zero, 0.25f };
+		b3ShapeId sphereShapeId = b3CreateSphereShape( sphereBodyId, &shapeDef, &sphere );
+		ContinuousContactIdCapture capture = {
+			.nearShapeId = nearShapeId,
+			.farShapeId = farShapeId,
+			.sphereShapeId = sphereShapeId,
+			.nearChildIndex = layout == 2 ? 0 : B3_NULL_INDEX,
+			.farChildIndex = layout == 2 ? 1 : B3_NULL_INDEX,
+			.marker = 1000000.0f,
+			.maxPushSpeed = FLT_MAX,
+			.contactDampingRatio = 1.0f,
+			.farSharesContact = layout == 0,
+			.expectFresh = true,
+			.dataValid = true,
+		};
+		b3World_SetPreSolveCallback( worldId, CheckContinuousContactId, &capture );
+		// A collision-only update must not make the following advancing step's stamp ambiguous.
+		b3World_Step( worldId, 0.0f, 1 );
+		ENSURE( capture.discreteCount == 1 && capture.dataValid );
+		for ( int step = 0; step < 8; ++step )
+		{
+			b3ContactId destroyedContactId = b3_nullContactId;
+			if ( step == 6 && layout == 0 )
+			{
+				// Reuse the freed contact slot with a new shape generation, but no current approval.
+				destroyedContactId = capture.discreteContactId;
+				b3DestroyBody( sphereBodyId );
+				ENSURE( b3Contact_IsValid( destroyedContactId ) == false );
+				sphereBodyId = b3CreateBody( worldId, &bodyDef );
+				capture.sphereShapeId = b3CreateSphereShape( sphereBodyId, &shapeDef, &sphere );
+			}
+			capture.discreteAction = step == 2 || step == 6 ? 1 : step == 4 ? 2 : 0;
+			capture.expectFresh = capture.discreteAction == 0;
+			capture.discreteCount = 0;
+			capture.nearCount = 0;
+			capture.farCount = 0;
+			capture.marker += 1.0f;
+			b3Body_SetTransform( sphereBodyId, bodyDef.position, b3Quat_identity );
+			b3Body_SetLinearVelocity( sphereBodyId, (b3Vec3){ -210.0f, 0.0f, 0.0f } );
+			b3World_Step( worldId, 1.0f / 60.0f, 1 );
+			ENSURE( capture.discreteCount == 1 );
+			ENSURE( capture.nearCount > 0 && capture.farCount > 0 );
+			ENSURE( capture.dataValid );
+			ENSURE( CheckFiniteContactBody( sphereBodyId ) == 0 );
+			if ( B3_IS_NON_NULL( destroyedContactId ) )
+			{
+				ENSURE( capture.discreteContactId.index1 == destroyedContactId.index1 );
+				ENSURE( capture.discreteContactId.generation != destroyedContactId.generation );
+				ENSURE( b3Contact_IsValid( destroyedContactId ) == false );
+			}
+			float x = b3Body_GetPosition( sphereBodyId ).x;
+			ENSURE( 0.15f < x && x < 0.5f );
+
+			if ( step == 0 && layout == 0 )
+			{
+				// Record only the seed snapshot, with a solved, callback-modified contact and its step stamp.
+				b3Recording* recording = b3CreateRecording( 0 );
+				ENSURE( recording != NULL );
+				b3World_StartRecording( worldId, recording );
+				b3World_StopRecording( worldId );
+				b3RecPlayer* player = b3CreatePlayer( b3Recording_GetData( recording ), b3Recording_GetSize( recording ), 1 );
+				ENSURE( player != NULL );
+				b3DestroyRecording( recording );
+				b3WorldId restoredWorldId = b3RecPlayer_GetWorldId( player );
+				b3BodyId restoredWallId = b3RecPlayer_GetBodyId( player, 0 );
+				b3BodyId restoredSphereId = b3RecPlayer_GetBodyId( player, 1 );
+				ContinuousContactIdCapture restoredCapture = capture;
+				ENSURE( b3Body_GetShapes( restoredWallId, &restoredCapture.nearShapeId, 1 ) == 1 );
+				ENSURE( b3Body_GetShapes( restoredSphereId, &restoredCapture.sphereShapeId, 1 ) == 1 );
+				restoredCapture.farShapeId = restoredCapture.nearShapeId;
+				b3World_SetPreSolveCallback( restoredWorldId, CheckContinuousContactId, &restoredCapture );
+				b3Pos firstPosition = b3Pos_zero;
+				b3Vec3 firstVelocity = b3Vec3_zero;
+				for ( int continuation = 0; continuation < 4; ++continuation )
+				{
+					// Restore in place while the callback is attached; host callback wiring is not serialized.
+					b3RecPlayer_Restart( player );
+					b3ContactData restoredContact[1];
+					ENSURE( b3Body_GetContactData( restoredSphereId, restoredContact, 1 ) == 1 );
+					ENSURE( restoredContact[0].manifoldCount > 0 );
+					ENSURE( restoredContact[0].manifolds[0].maxPushSpeed == capture.maxPushSpeed );
+					ENSURE( restoredContact[0].manifolds[0].contactDampingRatio == capture.contactDampingRatio );
+					ENSURE( restoredContact[0].manifolds[0].points[0].maxNormalImpulse == capture.marker );
+					restoredCapture.discreteContactId = restoredContact[0].contactId;
+					restoredCapture.discreteAction = continuation % 3;
+					restoredCapture.expectFresh = restoredCapture.discreteAction == 0;
+					restoredCapture.discreteCount = 0;
+					restoredCapture.nearCount = 0;
+					restoredCapture.farCount = 0;
+					restoredCapture.marker += 1.0f;
+					b3Body_SetTransform( restoredSphereId, bodyDef.position, b3Quat_identity );
+					b3Body_SetLinearVelocity( restoredSphereId, (b3Vec3){ -210.0f, 0.0f, 0.0f } );
+					b3World_Step( restoredWorldId, 1.0f / 60.0f, 1 );
+					ENSURE( restoredCapture.discreteCount == 1 && restoredCapture.nearCount > 0 && restoredCapture.farCount > 0 );
+					ENSURE( restoredCapture.dataValid );
+					ENSURE( CheckFiniteContactBody( restoredSphereId ) == 0 );
+					b3Pos position = b3Body_GetPosition( restoredSphereId );
+					b3Vec3 velocity = b3Body_GetLinearVelocity( restoredSphereId );
+					ENSURE( 0.15f < position.x && position.x < 0.5f );
+					if ( continuation == 0 )
+					{
+						firstPosition = position;
+						firstVelocity = velocity;
+					}
+					else if ( continuation == 3 )
+					{
+						ENSURE( memcmp( &position, &firstPosition, sizeof( position ) ) == 0 );
+						ENSURE( memcmp( &velocity, &firstVelocity, sizeof( velocity ) ) == 0 );
+					}
+				}
+				b3DestroyPlayer( player );
+			}
+		}
+
+		b3DestroyWorld( worldId );
+		if ( compound != NULL )
+		{
+			b3DestroyCompound( compound );
+		}
+		if ( farMesh != NULL )
+		{
+			b3DestroyMesh( farMesh );
+		}
+		b3DestroyMesh( nearMesh );
+	}
+	return 0;
+}
+
+static bool CheckParallelContinuousContactId( b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3PreSolveData* data, void* context )
+{
+	(void)context;
+	// Each isolated static/dynamic pair has its own capture. Narrow phase finishes before CCD,
+	// and a fast body's CCD candidates are processed by one task, so no counter is shared by writers.
+	ContinuousContactIdCapture* capture = b3Shape_GetUserData( shapeIdB );
+	if ( data->phase == b3_preSolveContinuous )
+	{
+#if defined( _MSC_VER )
+		static __declspec( thread ) int threadToken;
+#else
+		static _Thread_local int threadToken;
+#endif
+		capture->continuousThread = &threadToken;
+	}
+	return CheckContinuousContactId( shapeIdA, shapeIdB, data, capture );
+}
+
+static int TestParallelContinuousPreSolveContactId( void )
+{
+	// Exceeds the collide (20), CCD/finalize (16), and bullet CCD (8) task ranges by many blocks.
+	enum { pairCount = 256 };
+	b3Vec3 vertices[8] = {
+		{ 1.0f, -5.0f, -5.0f }, { 1.0f, 5.0f, -5.0f }, { 1.0f, 5.0f, 5.0f }, { 1.0f, -5.0f, 5.0f },
+		{ 0.0f, -5.0f, -5.0f }, { 0.0f, 5.0f, -5.0f }, { 0.0f, 5.0f, 5.0f }, { 0.0f, -5.0f, 5.0f },
+	};
+	int32_t indices[12] = { 0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7 };
+	b3MeshDef meshDef = { .vertices = vertices, .indices = indices, .vertexCount = 8, .triangleCount = 4 };
+	b3MeshData* mesh = b3CreateMesh( &meshDef, NULL, 0 );
+	ENSURE( mesh != NULL );
+	b3Pos referencePositions[3][pairCount];
+	b3Vec3 referenceVelocities[3][pairCount];
+	// Each CCD path gets its own serial reference and four-worker run.
+	for ( int run = 0; run < 4; ++run )
+	{
+		int parallel = run % 2;
+		bool isBullet = run >= 2;
+		b3WorldDef worldDef = b3DefaultWorldDef();
+		worldDef.gravity = b3Vec3_zero;
+		worldDef.workerCount = parallel != 0 ? 4 : 1;
+		b3WorldId worldId = b3CreateWorld( &worldDef );
+		ENSURE( b3World_GetWorkerCount( worldId ) == worldDef.workerCount );
+		b3BodyId bodies[pairCount];
+		ContinuousContactIdCapture captures[pairCount] = { 0 };
+		for ( int i = 0; i < pairCount; ++i )
+		{
+			b3BodyDef bodyDef = b3DefaultBodyDef();
+			bodyDef.position.z = 12.0f * i;
+			b3BodyId wallId = b3CreateBody( worldId, &bodyDef );
+			b3ShapeDef shapeDef = b3DefaultShapeDef();
+			b3ShapeId wallShapeId = b3CreateMeshShape( wallId, &shapeDef, mesh, b3Vec3_one );
+			bodyDef.type = b3_dynamicBody;
+			bodyDef.position.x = 1.255f;
+			bodyDef.isBullet = isBullet;
+			bodies[i] = b3CreateBody( worldId, &bodyDef );
+			ENSURE( b3Body_IsBullet( bodies[i] ) == isBullet );
+			shapeDef.enablePreSolveEvents = true;
+			shapeDef.userData = captures + i;
+			b3Sphere sphere = { b3Vec3_zero, 0.25f };
+			b3ShapeId sphereShapeId = b3CreateSphereShape( bodies[i], &shapeDef, &sphere );
+			captures[i] = (ContinuousContactIdCapture){
+				.nearShapeId = wallShapeId,
+				.farShapeId = wallShapeId,
+				.sphereShapeId = sphereShapeId,
+				.nearChildIndex = B3_NULL_INDEX,
+				.farChildIndex = B3_NULL_INDEX,
+				.marker = 1000000.0f + 4.0f * i,
+				.maxPushSpeed = FLT_MAX,
+				.contactDampingRatio = 1.0f,
+				.farSharesContact = true,
+				.expectFresh = true,
+				.dataValid = true,
+			};
+		}
+		b3World_SetPreSolveCallback( worldId, CheckParallelContinuousContactId, NULL );
+		bool multipleCCDThreads = false;
+		for ( int step = 0; step < 3; ++step )
+		{
+			for ( int i = 0; i < pairCount; ++i )
+			{
+				captures[i].discreteCount = 0;
+				captures[i].nearCount = 0;
+				captures[i].farCount = 0;
+				captures[i].continuousThread = NULL;
+				// Mix fresh approvals, rejections, and empty manifolds on the middle step, then re-approve.
+				captures[i].discreteAction = step == 1 ? i % 3 : 0;
+				captures[i].expectFresh = captures[i].discreteAction == 0;
+				captures[i].marker += 1.0f;
+				b3Body_SetTransform( bodies[i], (b3Pos){ 1.255f, 0.0f, 12.0f * i }, b3Quat_identity );
+				b3Body_SetLinearVelocity( bodies[i], (b3Vec3){ -210.0f, 0.0f, 0.0f } );
+			}
+			b3World_Step( worldId, 1.0f / 60.0f, 1 );
+			for ( int i = 0; i < pairCount; ++i )
+			{
+				ENSURE( captures[i].discreteCount == 1 && captures[i].nearCount > 0 && captures[i].farCount > 0 );
+				ENSURE( captures[i].dataValid && captures[i].continuousThread != NULL );
+				multipleCCDThreads = multipleCCDThreads || captures[i].continuousThread != captures[0].continuousThread;
+				ENSURE( CheckFiniteContactBody( bodies[i] ) == 0 );
+				b3Pos position = b3Body_GetPosition( bodies[i] );
+				b3Vec3 velocity = b3Body_GetLinearVelocity( bodies[i] );
+				ENSURE( 0.15f < position.x && position.x < 0.5f );
+				if ( parallel == 0 )
+				{
+					referencePositions[step][i] = position;
+					referenceVelocities[step][i] = velocity;
+				}
+				else
+				{
+					ENSURE( memcmp( &position, &referencePositions[step][i], sizeof( position ) ) == 0 );
+					ENSURE( memcmp( &velocity, &referenceVelocities[step][i], sizeof( velocity ) ) == 0 );
+				}
+			}
+		}
+		// workerCount alone is not evidence that callbacks actually ran on more than one thread.
+		ENSURE( multipleCCDThreads == ( parallel != 0 ) );
+		b3DestroyWorld( worldId );
+	}
+	b3DestroyMesh( mesh );
+	return 0;
+}
+
+static int TestContinuousPreSolveStaleContactId( void )
+{
+	b3Vec3 vertices[4] = {
+		{ 1.0f, -5.0f, -5.0f }, { 1.0f, 5.0f, -5.0f }, { 1.0f, 5.0f, 5.0f }, { 1.0f, -5.0f, 5.0f },
+	};
+	int32_t indices[6] = { 0, 1, 2, 0, 2, 3 };
+	b3MeshDef meshDef = { .vertices = vertices, .indices = indices, .vertexCount = 4, .triangleCount = 2 };
+	b3MeshData* mesh = b3CreateMesh( &meshDef, NULL, 0 );
+	ENSURE( mesh != NULL );
+	b3WorldDef worldDef = b3DefaultWorldDef();
+	worldDef.gravity = b3Vec3_zero;
+	worldDef.workerCount = 1;
+	b3WorldId worldId = b3CreateWorld( &worldDef );
+	b3BodyDef bodyDef = b3DefaultBodyDef();
+	b3BodyId staticBodyId = b3CreateBody( worldId, &bodyDef );
+	b3ShapeDef shapeDef = b3DefaultShapeDef();
+	b3ShapeId meshShapeId = b3CreateMeshShape( staticBodyId, &shapeDef, mesh, b3Vec3_one );
+	bodyDef.type = b3_dynamicBody;
+	bodyDef.position = (b3Pos){ 1.255f, 0.0f, 0.0f };
+	b3BodyId sphereBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef.enablePreSolveEvents = true;
+	b3Sphere sphere = { b3Vec3_zero, 0.25f };
+	b3ShapeId sphereShapeId = b3CreateSphereShape( sphereBodyId, &shapeDef, &sphere );
+	ContinuousContactIdCapture capture = {
+		.nearShapeId = meshShapeId,
+		.farShapeId = meshShapeId,
+		.sphereShapeId = sphereShapeId,
+		.nearChildIndex = B3_NULL_INDEX,
+		.farChildIndex = B3_NULL_INDEX,
+		.marker = 1000000.0f,
+		.maxPushSpeed = FLT_MAX,
+		.contactDampingRatio = 1.0f,
+		.expectFresh = true,
+		.dataValid = true,
+	};
+	b3World_SetPreSolveCallback( worldId, CheckContinuousContactId, &capture );
+	b3World_Step( worldId, 1.0f / 60.0f, 1 );
+	ENSURE( capture.discreteCount == 1 && capture.dataValid );
+	b3ContactId oldContactId = capture.discreteContactId;
+	b3Body_SetAwake( sphereBodyId, false );
+	ENSURE( b3Body_IsAwake( sphereBodyId ) == false );
+
+	// A new impacting body wakes the sleeper after narrow phase has already collected its work.
+	// Its old mesh contact is solved this step, but did not receive this step's discrete callback.
+	bodyDef.position = (b3Pos){ 1.95f, 0.0f, 0.0f };
+	bodyDef.linearVelocity = (b3Vec3){ -60.0f, 0.0f, 0.0f };
+	b3BodyId strikerBodyId = b3CreateBody( worldId, &bodyDef );
+	shapeDef.enablePreSolveEvents = false;
+	sphere.radius = 0.5f;
+	b3CreateSphereShape( strikerBodyId, &shapeDef, &sphere );
+	capture.discreteCount = 0;
+	capture.nearCount = 0;
+	capture.expectFresh = false;
+	b3World_Step( worldId, 1.0f / 60.0f, 1 );
+	ENSURE( b3Body_IsAwake( sphereBodyId ) );
+	ENSURE( capture.discreteCount == 0 );
+	ENSURE( capture.nearCount > 0 );
+	ENSURE( capture.dataValid );
+	ENSURE( b3Contact_IsValid( oldContactId ) );
+	b3ContactData oldContact = b3Contact_GetData( oldContactId );
+	ENSURE( oldContact.manifoldCount > 0 && oldContact.manifolds[0].maxPushSpeed == FLT_MAX );
+	ENSURE( oldContact.manifolds[0].contactDampingRatio == 1.0f );
+
+	b3DestroyWorld( worldId );
+	b3DestroyMesh( mesh );
+	return 0;
+}
+
+static int TestPreSolveStaleManifoldTuning( void )
+{
+	b3Vec3 vertices[4] = {
+		{ 1.0f, -5.0f, -5.0f }, { 1.0f, 5.0f, -5.0f }, { 1.0f, 5.0f, 5.0f }, { 1.0f, -5.0f, 5.0f },
+	};
+	int32_t indices[6] = { 0, 1, 2, 0, 2, 3 };
+	b3MeshDef meshDef = { .vertices = vertices, .indices = indices, .vertexCount = 4, .triangleCount = 2 };
+	b3MeshData* mesh = b3CreateMesh( &meshDef, NULL, 0 );
+	ENSURE( mesh != NULL );
+	for ( int meshIndex = 0; meshIndex < 2; ++meshIndex )
+	{
+		// Independently expose stale speed, stale damping, and both together.
+		for ( int tuning = 0; tuning < 3; ++tuning )
+		{
+			b3Pos positions[2];
+			b3Vec3 velocities[2];
+			float worldSpeed = tuning == 1 ? FLT_MAX : 0.03f;
+			for ( int reference = 0; reference < 2; ++reference )
+			{
+				b3WorldDef worldDef = b3DefaultWorldDef();
+				worldDef.gravity = b3Vec3_zero;
+				worldDef.workerCount = 1;
+				worldDef.contactDampingRatio = 1.0f;
+				b3WorldId worldId = b3CreateWorld( &worldDef );
+				b3BodyDef bodyDef = b3DefaultBodyDef();
+				bodyDef.position.x = meshIndex == 0 ? 0.5f : 0.0f;
+				b3BodyId staticBodyId = b3CreateBody( worldId, &bodyDef );
+				b3ShapeDef shapeDef = b3DefaultShapeDef();
+				b3BoxHull wall = b3MakeBoxHull( 0.5f, 5.0f, 5.0f );
+				b3ShapeId wallShapeId = meshIndex == 0 ? b3CreateHullShape( staticBodyId, &shapeDef, &wall.base )
+													 : b3CreateMeshShape( staticBodyId, &shapeDef, mesh, b3Vec3_one );
+
+				bodyDef.type = b3_dynamicBody;
+				bodyDef.position = (b3Pos){ 1.255f, 0.0f, 0.0f };
+				b3BodyId sphereBodyId = b3CreateBody( worldId, &bodyDef );
+				shapeDef.enablePreSolveEvents = true;
+				b3Sphere sphere = { b3Vec3_zero, 0.25f };
+				b3ShapeId sphereShapeId = b3CreateSphereShape( sphereBodyId, &shapeDef, &sphere );
+				ContinuousContactIdCapture capture = {
+					.nearShapeId = wallShapeId,
+					.farShapeId = wallShapeId,
+					.sphereShapeId = sphereShapeId,
+					.nearChildIndex = B3_NULL_INDEX,
+					.farChildIndex = B3_NULL_INDEX,
+					.marker = 1000000.0f,
+					.maxPushSpeed = reference == 0 && tuning != 1 ? 0.0f : worldSpeed,
+					.contactDampingRatio = reference == 0 && tuning != 0 ? 1.0f : -1.0f,
+					.dataValid = true,
+				};
+				b3World_SetPreSolveCallback( worldId, CheckContinuousContactId, &capture );
+				// Store different tuning without solving, so both sleepers start from identical states.
+				b3World_Step( worldId, 0.0f, 1 );
+				ENSURE( capture.discreteCount == 1 && capture.dataValid );
+				b3ContactId oldContactId = capture.discreteContactId;
+				b3Body_SetAwake( sphereBodyId, false );
+				ENSURE( b3Body_IsAwake( sphereBodyId ) == false );
+				b3World_SetContactTuning( worldId, worldDef.contactHertz, 10.0f, worldSpeed );
+
+				// As in the stale CCD-id fixture, this contact wakes the sleeper only after narrow phase.
+				bodyDef.position = (b3Pos){ 1.95f, 0.0f, 0.0f };
+				bodyDef.linearVelocity = (b3Vec3){ -60.0f, 0.0f, 0.0f };
+				b3BodyId strikerBodyId = b3CreateBody( worldId, &bodyDef );
+				shapeDef.enablePreSolveEvents = false;
+				sphere.radius = 0.5f;
+				b3CreateSphereShape( strikerBodyId, &shapeDef, &sphere );
+				capture.discreteCount = 0;
+				b3World_Step( worldId, 1.0f / 60.0f, 1 );
+				ENSURE( b3Body_IsAwake( sphereBodyId ) );
+				ENSURE( capture.discreteCount == 0 && capture.nearCount > 0 && capture.dataValid );
+				ENSURE( b3Contact_IsValid( oldContactId ) );
+				b3ContactData oldContact = b3Contact_GetData( oldContactId );
+				ENSURE( oldContact.manifoldCount == 1 );
+				ENSURE( oldContact.manifolds[0].maxPushSpeed == capture.maxPushSpeed );
+				ENSURE( oldContact.manifolds[0].contactDampingRatio == capture.contactDampingRatio );
+				ENSURE( oldContact.manifolds[0].points[0].maxNormalImpulse == capture.marker );
+				positions[reference] = b3Body_GetPosition( sphereBodyId );
+				velocities[reference] = b3Body_GetLinearVelocity( sphereBodyId );
+				ENSURE( CheckFiniteContactBody( sphereBodyId ) == 0 );
+				ENSURE( CheckFiniteContactBody( strikerBodyId ) == 0 );
+				b3DestroyWorld( worldId );
+			}
+			// Old manifold fields remain observable, but cannot retune this step's constraints.
+			ENSURE( positions[1].y > 0.0f );
+			ENSURE( memcmp( positions, positions + 1, sizeof( positions[0] ) ) == 0 );
+			ENSURE( memcmp( velocities, velocities + 1, sizeof( velocities[0] ) ) == 0 );
+		}
+	}
+	b3DestroyMesh( mesh );
+	return 0;
+}
+
 // Ensure correct move events from bodies involved in CCD and ensure a null pre-solve callback is safe.
 static int TestContinuousMoveEvent( void )
 {
@@ -2634,6 +3872,11 @@ int WorldTest( void )
 	RUN_SUBTEST( TestPreSolveDisablesAllPoints );
 	RUN_SUBTEST( TestPreSolveMutableContact );
 	RUN_SUBTEST( TestPreSolveMaxNormalImpulse );
+	RUN_SUBTEST( TestPreSolveMaxPushSpeed );
+	RUN_SUBTEST( TestPreSolveContactDampingRatio );
+	RUN_SUBTEST( TestPreSolveDampingManifoldIsolation );
+	RUN_SUBTEST( TestPreSolveLoadedTuningTransitions );
+	RUN_SUBTEST( TestPreSolveOverflowTuning );
 	RUN_SUBTEST( TestPreSolveZeroRestitution );
 	RUN_SUBTEST( TestPreSolveFrictionAffectsSliding );
 	RUN_SUBTEST( TestNullPreSolveCallbackUsesOrdinaryContacts );
@@ -2649,6 +3892,10 @@ int WorldTest( void )
 	RUN_SUBTEST( TestSensor );
 	RUN_SUBTEST( TestContinuousPreSolveRejectsCandidate );
 	RUN_SUBTEST( TestContinuousPreSolveAcceptsLaterTriangle );
+	RUN_SUBTEST( TestContinuousPreSolveContactId );
+	RUN_SUBTEST( TestParallelContinuousPreSolveContactId );
+	RUN_SUBTEST( TestContinuousPreSolveStaleContactId );
+	RUN_SUBTEST( TestPreSolveStaleManifoldTuning );
 	RUN_SUBTEST( TestContinuousMoveEvent );
 	RUN_SUBTEST( TestContactEvents );
 	RUN_SUBTEST( TestHitEvents );

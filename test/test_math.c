@@ -2,17 +2,90 @@
 // SPDX-License-Identifier: MIT
 
 #include "math_internal.h"
+#include "solver.h"
 #include "utils.h"
 #include "test_macros.h"
 
 #include <float.h>
 #include <stdio.h>
+#include <string.h>
 
 // 0.0023 degrees
 #define ATAN_TOL 0.00004f
 
+static int TestSoftness( void )
+{
+	const float timeSteps[] = { 1.0f / 30.0f, 1.0f / 60.0f, 1.0f / 120.0f };
+	const int subStepCounts[] = { 1, 4, 8 };
+	const float contactHertz[] = { 0.0f, 0.5f, 10.0f, 30.0f, 120.0f };
+	const float dampingRatios[] = { 0.0f, 0.1f, 0.5f, 1.0f, 10.0f, 1000.0f, 1.0e6f,
+									FLT_MAX / 8.0f, FLT_MAX / 4.0f, FLT_MAX / 2.0f, FLT_MAX };
+
+	for ( int t = 0; t < ARRAY_COUNT( timeSteps ); ++t )
+	{
+		for ( int s = 0; s < ARRAY_COUNT( subStepCounts ); ++s )
+		{
+			float h = timeSteps[t] / (float)subStepCounts[s];
+			for ( int f = 0; f < ARRAY_COUNT( contactHertz ); ++f )
+			{
+				float effectiveHertz = b3MinFloat( contactHertz[f], 0.125f * ( 1.0f / h ) );
+				for ( int isStatic = 0; isStatic < 2; ++isStatic )
+				{
+					float hertz = isStatic ? 2.0f * effectiveHertz : effectiveHertz;
+					for ( int d = 0; d < ARRAY_COUNT( dampingRatios ); ++d )
+					{
+						float zeta = isStatic ? 0.5f * dampingRatios[d] : dampingRatios[d];
+						b3Softness soft = b3MakeSoft( hertz, zeta, h );
+						ENSURE( b3IsValidFloat( soft.biasRate ) );
+						ENSURE( b3IsValidFloat( soft.massScale ) );
+						ENSURE( b3IsValidFloat( soft.impulseScale ) );
+
+						if ( hertz == 0.0f )
+						{
+							ENSURE( soft.biasRate == 0.0f && soft.massScale == 0.0f && soft.impulseScale == 0.0f );
+							continue;
+						}
+
+						ENSURE( soft.biasRate > 0.0f && soft.biasRate <= ( 1.0f + FLT_EPSILON ) / h );
+						ENSURE( soft.massScale >= 0.0f && soft.massScale <= 1.0f );
+						ENSURE( soft.impulseScale > 0.0f && soft.impulseScale <= 1.0f );
+						ENSURE_SMALL( soft.massScale + soft.impulseScale - 1.0f, 2.0f * FLT_EPSILON );
+
+						// Keep the old float arithmetic, including its rounding, as the ordinary-range reference.
+						float omega = 2.0f * B3_PI * hertz;
+						float a1 = 2.0f * zeta + h * omega;
+						float a2 = h * omega * a1;
+						if ( isfinite( a2 ) )
+						{
+							float a3 = 1.0f / ( 1.0f + a2 );
+							b3Softness old = { .biasRate = omega / a1, .massScale = a2 * a3, .impulseScale = a3 };
+							ENSURE( memcmp( &soft.biasRate, &old.biasRate, sizeof( float ) ) == 0 );
+							ENSURE( memcmp( &soft.massScale, &old.massScale, sizeof( float ) ) == 0 );
+							ENSURE( memcmp( &soft.impulseScale, &old.impulseScale, sizeof( float ) ) == 0 );
+						}
+						else
+						{
+							// Large finite damping still has nonzero bias/impulse coefficients, not a clamped limit.
+							double w = 2.0 * B3_PI * hertz;
+							double denominator = 2.0 * zeta + h * w;
+							float biasRate = (float)( w / denominator );
+							float impulseScale = (float)( 1.0 / ( 1.0 + h * w * denominator ) );
+							ENSURE_SMALL( soft.biasRate / biasRate - 1.0f, 4.0f * FLT_EPSILON );
+							ENSURE_SMALL( soft.impulseScale / impulseScale - 1.0f, 4.0f * FLT_EPSILON );
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return 0;
+}
+
 int MathTest( void )
 {
+	RUN_SUBTEST( TestSoftness );
+
 	for ( float t = -10.0f; t < 10.0f; t += 0.01f )
 	{
 		float angle = B3_PI * t;

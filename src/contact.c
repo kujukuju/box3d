@@ -754,6 +754,7 @@ static bool b3InvokeDiscretePreSolve( b3World* world, b3Contact* contact, b3Shap
 		.childIndexB = B3_NULL_INDEX,
 		.triangleIndexA = B3_NULL_INDEX,
 		.triangleIndexB = B3_NULL_INDEX,
+		.contactId = { contact->contactId + 1, world->worldId, 0, contact->generation },
 	};
 
 	b3PreSolveData originalData = data;
@@ -771,7 +772,8 @@ static bool b3InvokeDiscretePreSolve( b3World* world, b3Contact* contact, b3Shap
 					   data.point.y == originalData.point.y && data.point.z == originalData.point.z &&
 					   data.normal.x == originalData.normal.x && data.normal.y == originalData.normal.y &&
 					   data.normal.z == originalData.normal.z && data.fraction == originalData.fraction &&
-					   data.triangleIndexA == originalData.triangleIndexA && data.triangleIndexB == originalData.triangleIndexB;
+					   data.triangleIndexA == originalData.triangleIndexA && data.triangleIndexB == originalData.triangleIndexB &&
+					   B3_ID_EQUALS( data.contactId, originalData.contactId ) && data.contactId.padding == originalData.contactId.padding;
 
 	int manifoldCount = 0;
 	if ( enabled && validOutput )
@@ -782,7 +784,10 @@ static bool b3InvokeDiscretePreSolve( b3World* world, b3Contact* contact, b3Shap
 			const b3Manifold* originalManifold = originalManifolds + manifoldIndex;
 			int sourcePointCount = originalManifold->pointCount;
 			if ( manifold->pointCount != sourcePointCount || sourcePointCount <= 0 || B3_MAX_MANIFOLD_POINTS < sourcePointCount ||
-				 b3IsNormalized( manifold->normal ) == false || manifold->twistImpulse != originalManifold->twistImpulse ||
+				 b3IsNormalized( manifold->normal ) == false || b3IsValidFloat( manifold->maxPushSpeed ) == false ||
+				 manifold->maxPushSpeed < 0.0f || b3IsValidFloat( manifold->contactDampingRatio ) == false ||
+				 ( manifold->contactDampingRatio < 0.0f && manifold->contactDampingRatio != -1.0f ) ||
+				 manifold->twistImpulse != originalManifold->twistImpulse ||
 				 manifold->frictionImpulse.x != originalManifold->frictionImpulse.x ||
 				 manifold->frictionImpulse.y != originalManifold->frictionImpulse.y ||
 				 manifold->frictionImpulse.z != originalManifold->frictionImpulse.z ||
@@ -891,6 +896,7 @@ static bool b3InvokeDiscretePreSolve( b3World* world, b3Contact* contact, b3Shap
 		contact->manifolds = manifolds;
 	}
 	contact->manifoldCount = manifoldCount;
+	contact->preSolveStepIndex = world->stepIndex;
 	return true;
 }
 
@@ -1034,6 +1040,8 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 		for ( int i = 0; i < contact->manifoldCount; ++i )
 		{
 			b3Manifold* manifold = contact->manifolds + i;
+			manifold->maxPushSpeed = world->contactSpeed;
+			manifold->contactDampingRatio = -1.0f;
 			for ( int j = 0; j < manifold->pointCount; ++j )
 			{
 				b3ManifoldPoint* mp = manifold->points + j;

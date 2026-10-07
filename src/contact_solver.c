@@ -157,13 +157,14 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 			contactConstraint->invIB = iB;
 			contactConstraint->invMassB = mB;
 			contactConstraint->rollingMass = b3InvertMatrix( b3AddMM( iA, iB ) );
-			contactConstraint->softness =
-				( contact->flags & b3_contactStaticFlag ) != 0 ? context->staticSoftness : context->contactSoftness;
+			bool isStatic = ( contact->flags & b3_contactStaticFlag ) != 0;
+			b3Softness softness = isStatic ? context->staticSoftness : context->contactSoftness;
 			contactConstraint->friction = contact->friction;
 			contactConstraint->restitution = contact->restitution;
 			contactConstraint->rollingResistance = contact->rollingResistance;
 			contactConstraint->usePointProperties =
 				world->preSolveFcn != NULL && ( contact->flags & b3_simEnablePreSolveEvents ) != 0;
+			bool useManifoldTuning = contactConstraint->usePointProperties && contact->preSolveStepIndex == world->stepIndex;
 
 			b3ManifoldConstraint* manifoldConstraints = manifoldBase + specs[localIndex].manifoldStart;
 			contactConstraint->constraints = manifoldConstraints;
@@ -179,6 +180,14 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 
 				constraint->pointCount = pointCount;
 				constraint->normal = normal;
+				constraint->maxPushSpeed = useManifoldTuning ? manifold->maxPushSpeed : world->contactSpeed;
+				constraint->softness = softness;
+				if ( useManifoldTuning && manifold->contactDampingRatio >= 0.0f )
+				{
+					float hertz = isStatic ? 2.0f * context->contactHertz : context->contactHertz;
+					float dampingRatio = isStatic ? 0.5f * manifold->contactDampingRatio : manifold->contactDampingRatio;
+					constraint->softness = b3MakeSoft( hertz, dampingRatio, context->h );
+				}
 				constraint->tangent1 = tangent1;
 				constraint->tangent2 = tangent2;
 
@@ -396,7 +405,6 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 	int endIndex = startIndex + block.count;
 
 	float inv_h = context->inv_h;
-	const float contactSpeed = context->world->contactSpeed;
 
 	for ( int i = startIndex; i < endIndex; ++i )
 	{
@@ -422,7 +430,6 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 		b3Quat dqB = stateB->deltaRotation;
 
 		b3Vec3 dp = b3Sub( stateB->deltaPosition, stateA->deltaPosition );
-		b3Softness softness = contactConstraint->softness;
 		float friction = contactConstraint->friction;
 		float rollingResistance = contactConstraint->rollingResistance;
 		bool usePointProperties = contactConstraint->usePointProperties;
@@ -430,6 +437,7 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 		for ( int j = 0; j < manifoldCount; ++j )
 		{
 			b3ManifoldConstraint* constraint = contactConstraint->constraints + j;
+			b3Softness softness = constraint->softness;
 
 			int pointCount = constraint->pointCount;
 			b3Vec3 normal = constraint->normal;
@@ -461,7 +469,7 @@ void b3SolveContacts_Mesh( b3SolverBlock block, b3StepContext* context, bool use
 				}
 				else if ( useBias )
 				{
-					velocityBias = b3MaxFloat( softness.massScale * softness.biasRate * s, -contactSpeed );
+					velocityBias = b3MaxFloat( softness.massScale * softness.biasRate * s, -constraint->maxPushSpeed );
 					massScale = softness.massScale;
 					impulseScale = softness.impulseScale;
 				}
@@ -1024,6 +1032,7 @@ typedef struct b3ContactConstraintWide
 	b3FloatW tangentVelocity1;
 	b3FloatW tangentVelocity2;
 
+	b3FloatW maxPushSpeed;
 	b3FloatW biasRate;
 	b3FloatW massScale;
 	b3FloatW impulseScale;
@@ -1332,6 +1341,7 @@ void b3PrepareContacts_Convex( b3SolverBlock block, b3StepContext* context )
 				B3_ASSERT( contact->manifoldCount == 1 );
 				b3Manifold* manifold = contact->manifolds + 0;
 				bool usePointProperties = world->preSolveFcn != NULL && ( contact->flags & b3_simEnablePreSolveEvents ) != 0;
+				bool useManifoldTuning = usePointProperties && contact->preSolveStepIndex == world->stepIndex;
 
 				int indexA = contact->bodySimIndexA;
 				int indexB = contact->bodySimIndexB;
@@ -1415,7 +1425,14 @@ void b3PrepareContacts_Convex( b3SolverBlock block, b3StepContext* context )
 				( (float*)&constraint->invIB.cyz )[lane] = iB.cy.z;
 				( (float*)&constraint->invIB.czz )[lane] = iB.cz.z;
 
-				b3Softness soft = ( indexA == B3_NULL_INDEX || indexB == B3_NULL_INDEX ) ? staticSoftness : contactSoftness;
+				bool isStatic = indexA == B3_NULL_INDEX || indexB == B3_NULL_INDEX;
+				b3Softness soft = isStatic ? staticSoftness : contactSoftness;
+				if ( useManifoldTuning && manifold->contactDampingRatio >= 0.0f )
+				{
+					float hertz = isStatic ? 2.0f * context->contactHertz : context->contactHertz;
+					float dampingRatio = isStatic ? 0.5f * manifold->contactDampingRatio : manifold->contactDampingRatio;
+					soft = b3MakeSoft( hertz, dampingRatio, context->h );
+				}
 
 				b3Vec3 normal = manifold->normal;
 				( (float*)&constraint->normal.X )[lane] = normal.x;
@@ -1440,6 +1457,7 @@ void b3PrepareContacts_Convex( b3SolverBlock block, b3StepContext* context )
 				( (float*)&constraint->tangentVelocity1 )[lane] = b3Dot( contact->tangentVelocity, tangent1 );
 				( (float*)&constraint->tangentVelocity2 )[lane] = b3Dot( contact->tangentVelocity, tangent2 );
 
+				( (float*)&constraint->maxPushSpeed )[lane] = useManifoldTuning ? manifold->maxPushSpeed : world->contactSpeed;
 				( (float*)&constraint->biasRate )[lane] = soft.biasRate;
 				( (float*)&constraint->massScale )[lane] = soft.massScale;
 				( (float*)&constraint->impulseScale )[lane] = soft.impulseScale;
@@ -1671,7 +1689,6 @@ void b3SolveContacts_Convex( b3SolverBlock block, b3StepContext* context, bool u
 	b3BodyState* states = context->states;
 	b3ContactConstraintWide* constraints = context->graph->colors[block.colorIndex].wideConstraints;
 	b3FloatW inv_h = b3SplatW( context->inv_h );
-	b3FloatW contactSpeed = b3SplatW( -context->world->contactSpeed );
 	b3FloatW oneW = b3SplatW( 1.0f );
 	b3FloatW epsilonW = b3SplatW( FLT_EPSILON );
 
@@ -1730,7 +1747,7 @@ void b3SolveContacts_Convex( b3SolverBlock block, b3StepContext* context, bool u
 			// Apply speculative bias if separation is greater than zero, otherwise apply soft constraint bias
 			b3FloatW mask = b3GreaterThanW( s, b3ZeroW() );
 			b3FloatW specBias = b3MulW( s, inv_h );
-			b3FloatW softBias = b3MaxW( b3MulW( biasRate, s ), contactSpeed );
+			b3FloatW softBias = b3MaxW( b3MulW( biasRate, s ), b3NegW( c->maxPushSpeed ) );
 			b3FloatW bias = b3BlendW( softBias, specBias, mask );
 
 			b3FloatW pointMassScale = b3BlendW( massScale, oneW, mask );

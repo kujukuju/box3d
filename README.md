@@ -1,5 +1,7 @@
 # Box3D
 
+> **Local Fat Goblins fork:** [AI maintenance README](AI_README.md) records all local native changes, why they exist, callback/ABI contracts, and validation. Read and update it when changing this fork; see [AGENTS.md](AGENTS.md). The remaining README, including its LLM Usage statement, describes the upstream project.
+
 [![Build Status](https://github.com/erincatto/box3d/actions/workflows/build.yml/badge.svg)](https://github.com/erincatto/box3d/actions)
 [![CLA assistant](https://cla-assistant.io/readme/badge/erincatto/box3d)](https://cla-assistant.io/erincatto/box3d)
 

@@ -1108,6 +1108,8 @@ void b3World_Step( b3WorldId worldId, float timeStep, int subStepCount )
 
 	if ( timeStep > 0.0f )
 	{
+		// Advance before narrow phase so discrete pre-solve and CCD share the same freshness stamp.
+		world->stepIndex += 1;
 		context.inv_dt = 1.0f / timeStep;
 		context.h = timeStep / context.subStepCount;
 		context.inv_h = context.subStepCount * context.inv_dt;
@@ -1123,9 +1125,9 @@ void b3World_Step( b3WorldId worldId, float timeStep, int subStepCount )
 	world->inv_dt = context.inv_dt;
 
 	// Hertz values get reduced for large time steps
-	float contactHertz = b3MinFloat( world->contactHertz, 0.125f * context.inv_h );
-	context.contactSoftness = b3MakeSoft( contactHertz, world->contactDampingRatio, context.h );
-	context.staticSoftness = b3MakeSoft( 2.0f * contactHertz, 0.5f * world->contactDampingRatio, context.h );
+	context.contactHertz = b3MinFloat( world->contactHertz, 0.125f * context.inv_h );
+	context.contactSoftness = b3MakeSoft( context.contactHertz, world->contactDampingRatio, context.h );
+	context.staticSoftness = b3MakeSoft( 2.0f * context.contactHertz, 0.5f * world->contactDampingRatio, context.h );
 
 	context.restitutionThreshold = world->restitutionThreshold;
 	context.maxLinearVelocity = world->maxLinearSpeed;

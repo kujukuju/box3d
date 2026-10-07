@@ -158,6 +158,9 @@ typedef struct b3Contact
 	// This is monotonically advanced when a contact is allocated in this slot
 	// Used to check for invalid b3ContactId
 	uint32_t generation;
+
+	// Last step whose discrete callback completed with valid, enabled manifolds.
+	uint64_t preSolveStepIndex;
 } b3Contact;
 
 typedef struct b3ContactSpec

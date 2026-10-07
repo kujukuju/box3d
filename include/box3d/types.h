@@ -123,16 +123,24 @@ typedef struct b3PreSolveData
 
 	/// Continuous mesh or height-field triangle for shape B, or B3_NULL_INDEX.
 	int triangleIndexB;
+
+	/// Read-only contact id. Identifies the current contact during discrete pre-solve.
+	/// During continuous pre-solve, identifies a touching contact for this shape pair and compound child only if
+	/// its discrete callback completed successfully with enabled points in this time step; otherwise null.
+	/// Use b3Contact_GetData to read its solved manifolds during continuous pre-solve. Do not mutate them or retain
+	/// their pointers. Contact shape A/B order may differ from the continuous candidate; triangle matching is caller-owned.
+	b3ContactId contactId;
 } b3PreSolveData;
 
 /// Prototype for a pre-solve callback.
 /// This is called for awake solid contacts when either shape has enabled pre-solve events.
 /// A discrete callback is invoked once per updated contact in the contact's authoritative shape A/B order.
-/// It may modify b3Manifold::normal and the documented mutable fields in b3ManifoldPoint. Use b3PreSolve_SetPoint
-/// to move a point. Set b3ManifoldPoint::enabled to false to remove a point for the current step. If all points are
+/// It may modify b3Manifold::normal, b3Manifold::maxPushSpeed, b3Manifold::contactDampingRatio,
+/// and the documented mutable fields in b3ManifoldPoint.
+/// Use b3PreSolve_SetPoint to move a point. Set b3ManifoldPoint::enabled to false to remove a point for the current step. If all points are
 /// disabled, the contact is disabled for the step. Do not modify manifold pointers, manifold counts, or point counts.
-/// During continuous collision there is no solver manifold and all data fields are read-only; only returning false to reject
-/// the candidate has an effect.
+/// During continuous collision the manifold fields are null/zero and all data fields are read-only; only returning false
+/// to reject the candidate has an effect. A non-null contactId permits reading the matching solved contact with b3Contact_GetData.
 /// Notes:
 /// - this function must be thread-safe
 /// - this is only called if one of the shapes has enabled pre-solve events
@@ -2713,6 +2721,18 @@ typedef struct b3Manifold
 	/// The number of contact points, will be 0 to 4.
 	/// This is read-only during a pre-solve callback. Disable individual points with b3ManifoldPoint::enabled.
 	int pointCount;
+
+	/// Maximum normal penetration-recovery bias speed, in length units per second.
+	/// Initialized from the world's contactSpeed on each contact update. This may be modified during discrete pre-solve.
+	/// Must be finite and nonnegative. Zero disables recovery bias, not collision response.
+	/// FLT_MAX removes the speed cap while retaining contact softness. Speculative contacts and restitution are unaffected.
+	float maxPushSpeed;
+
+	/// Current-step contact damping ratio override, reset to -1 on each contact update.
+	/// -1 preserves world softness. Otherwise must be finite and nonnegative; may be modified during discrete pre-solve.
+	/// Uses the world's time-step-limited contact Hertz, including double Hertz and half damping for static contacts,
+	/// so this has the same effect on this manifold as setting the world's contactDampingRatio to this value.
+	float contactDampingRatio;
 
 } b3Manifold;
 
