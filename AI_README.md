@@ -2,31 +2,43 @@
 
 Last audited: **2026-10-08**. This is the cumulative record of local native changes, their reasons, and the contracts future AI-assisted changes must preserve. It supplements the API documentation in [docs/simulation.md](docs/simulation.md); it does not describe upstream Box3D features as our work.
 
-> **Review status:** the user explicitly accepts stair-induced ceiling penetration; do not add an upward-clearance sweep or destination-fit veto. The extreme-damping numerical hole is fixed, and the follow-up regressions/validation are recorded in §2.8. Windows/Linux rebuilds and real-player feel remain pending; this allowance is not blanket collision-safety verification.
+> **Review status:** the user explicitly accepts stair-induced ceiling penetration; do not add an upward-clearance sweep or destination-fit veto. The extreme-damping numerical hole is fixed, and the follow-up regressions/validation are recorded in §2.8. Linux x86-64 Box3D has now been rebuilt and tested (details below); Windows native rebuilding, Linux server rebuilding/deployment, and real-player feel remain pending. This allowance is not blanket collision-safety verification.
 
 ## Cross-platform rebuild TODO
 
-**AI handoff for the other PC — 2026-10-07. Both tasks are pending.** The callback ABI is now **0.3.0**; only macOS arm64 has been rebuilt. Old Windows/Linux libraries must not be paired with the updated bindings or executables.
+**AI handoff, updated 2026-10-08. Linux native rebuild complete; Windows native rebuild pending.** The callback ABI is **0.3.0**; macOS arm64 and Linux x86-64 libraries have been rebuilt. The Linux standalone server was deliberately not recompiled or deployed in the native-only follow-up. Old 0.2.0 libraries must not be paired with the updated bindings or executables.
 
-- [ ] **Synchronize sources first:** bring over the matching workspace, `box3d`, `JaiBox3D`, `FatGoblins`, and `FatGoblinsServer` changes. They span independent repositories and were uncommitted at this handoff. A pull cannot retrieve unpushed work; commit/push only when the user authorizes it, including updated root gitlinks. This TODO lives in repository documentation, not just local OptMem or ignored `.build/` files.
+- [ ] **Synchronize sources/artifacts before other-PC work:** bring over the matching workspace, `box3d`, `JaiBox3D`, `FatGoblins`, and `FatGoblinsServer` revisions. The native/binding build-source revisions are recorded below. Synchronize the rebuilt Linux runtime artifact and workspace gitlinks as well; source-only synchronization is insufficient. A pull cannot retrieve unpushed work; commit/push only when the user authorizes it, including updated root gitlinks. This TODO lives in repository documentation, not just local OptMem or ignored `.build/` files.
 - [ ] **Windows x64:** with CMake, the Visual Studio C++ x64 toolchain, and Jai available, run from sibling `JaiBox3D`:
   ```bat
   .\build_windows.bat
   .\test_windows.bat
   ```
   Confirm the rebuilt `bin/windows/box3d.dll` and matching `box3d.lib` are staged and the binding smoke test passes.
-- [ ] **Linux x86-64:** use an x86-64 Linux host/VM with CMake, Ninja, a C/C++ toolchain, and Jai. Run from sibling `JaiBox3D`:
+- [x] **Linux x86-64 native library:** rebuilt in the existing Lima Ubuntu x86-64 VM on this Mac; both commands below passed. For subsequent rebuilds, use an x86-64 Linux host/VM with CMake, Ninja, a C/C++ toolchain, and Jai. Run from sibling `JaiBox3D`:
   ```sh
   ./build_linux.sh
   ./test_linux.sh
   ```
-  Confirm `bin/linux/libbox3d.so.0.3.0` and the `.so.0.3` / `.so` symlinks are staged and the binding smoke test passes. Linux scope is the **standalone server**, not a Linux client port.
-- [ ] Run the native `WorldTest` / `RecordingTest` and relevant game regressions on each platform. The staging scripts build Release libraries with native unit tests disabled; the smoke scripts do not replace the native suite. Use a separate static native test build as described below.
+  `bin/linux/libbox3d.so.0.3.0` and the `.so.0.3` / `.so` symlinks are now staged in the host checkout, and the binding smoke passed. Linux native scope is the **standalone server**; the player client uses the Windows build through Steam, not a native Linux client.
+- [x] **Linux native regressions:** full separate Debug/heavy-validation suite passed, including `MathTest`, `WorldTest`, and `RecordingTest`. The release library also passed the Jai smoke. Linux game/server regressions were not run in this native-only task.
+- [ ] **Windows native regressions and consumer checks:** run the native suite and relevant game regressions. The staging scripts build Release libraries with native unit tests disabled; the smoke scripts do not replace the native suite. Use a separate static native test build as described below.
 - [ ] Rebuild the Windows game/embedded server and any Windows standalone server in use; rebuild the Linux standalone server against the matching library. Confirm runtime version **0.3.0**, single precision, architecture, and dynamic-library dependencies. If subsequent fixes change the ABI again, follow the actual current source version rather than forcing 0.3.0.
 - [ ] Stage/package native libraries and consumers together. Do not rename an old 0.2.0 library to the new SONAME, bypass the startup compatibility check, or deploy an executable-only Linux update to an old runtime.
-- [ ] Record source revisions, platform/toolchain, output artifacts, and actual test results here. Mark each platform complete only after its build and checks succeed. Keep player verification separate in [VERIFY_LATER.md](../VERIFY_LATER.md).
+- [ ] Record Windows source revisions, platform/toolchain, output artifacts, and actual test results here, as done for Linux below. Mark each task complete only after its own build/checks succeed; native completion does not complete consumer deployment. Keep player verification separate in [VERIFY_LATER.md](../VERIFY_LATER.md).
 
 **Build handoff is not player verification:** include the 2026-10-08 numerical fix and regressions in §2.8 when rebuilding. Stair-induced ceiling penetration is explicitly accepted behavior, not a pending request for a clearance veto. Building other platforms does not confirm player feel or authorize unrelated CCD bypasses. Local scratch reproduction files mentioned below will not travel through Git automatically.
+
+### Linux native rebuild record — 2026-10-08
+
+- **Sources:** `box3d` commit `272623419fb39ed0f4014f82b28f9b4dbecab603`; `JaiBox3D` commit `555be59dfd4f6f39b70a6d5d108bf8dafeef4ef4`. Clean committed source archives were built in a fresh guest-local directory, not the VM's old server checkout. No native source or binding changes were needed.
+- **Environment:** existing Lima `fatgoblins-linux` QEMU VM, Ubuntu 22.04.5 x86-64, GCC/G++ 11.4.0, CMake 3.22.1, Ninja 1.10.1. Final binding smoke used the Linux compiler/modules accompanying the current host Jai 0.2.030 installation; a preliminary smoke also passed with the older `/opt/jai` distribution.
+- **Artifact:** Release, single precision, SIMD enabled, `JaiBox3D/bin/linux/libbox3d.so.0.3.0` (1,146,816 bytes). SHA-256: `77a29fff81110c4181bbb8eeeb8d6fa2b4dcf11aed57b2e1880ae910cfddcf9a`. Host-staged bytes match the tested guest output. Symlink chain: `libbox3d.so` → `libbox3d.so.0.3` → `libbox3d.so.0.3.0`. The separately versioned 0.2 files were left untouched for older consumers, not relabeled as 0.3.
+- **Linkage:** ELF x86-64, SONAME `libbox3d.so.0.3`; only `libm.so.6` and `libc.so.6` are direct runtime dependencies. Highest required glibc symbol version is `GLIBC_2.34`; no build-directory RPATH/RUNPATH. `ldd` confirmed the smoke loaded the freshly built 0.3 library.
+- **Checks passed:** canonical `build_linux.sh`; canonical `test_linux.sh` (version, precision, mutable contacts, local recovery tuning, and CCD approval); separate native Debug build with heavy validation; targeted `WorldTest`; full native suite including numerical, recording, and parallel CCD regressions. Full suite duration was 132.91 seconds under emulation. No Linux sanitizer run or game/server executable build is claimed.
+- **Warnings:** GCC emitted `-Wmaybe-uninitialized` warnings in existing snapshot-version and recording query-bounds code; the build succeeded. No source was changed to suppress them.
+- **Evidence:** host-local `.build/box3d-linux-0.3.0/REPORT.md`, source archives, and `result/` build/test/linkage logs. These scratch files do not travel through Git automatically. The VM was returned to its original stopped state after copying results; no server deployment or service configuration was changed.
+- **Still required:** rebuild/test/package the Linux standalone server with this matching runtime before deployment, and complete the Windows native/consumer tasks above. The user requested only the Linux Box3D rebuild in this follow-up.
 
 ## Scope and provenance
 
@@ -309,7 +321,7 @@ This extreme-value weakness already exists through world damping, but the new ov
 
 **Validation on macOS arm64 against the final sources:** full native Debug, Release, and ASan+UBSan suites passed; `WorldTest` passed under ThreadSanitizer without a report. Ten additional ASan+UBSan `WorldTest` runs passed. The rebuilt Mac library passed Jai binding smoke. Full movement and client-physics suites, client + embedded-server build, and standalone-server build passed in isolated scratch outputs. Existing application outputs were untouched; runtime copies were checked against the freshly staged native library. Game validation evidence is retained locally in workspace `.build/stair-final-game/REPORT.md` and logs.
 
-**Remaining scope limits:** Windows/Linux have not been rebuilt or tested here. No player-feel confirmation or dense-mesh performance benchmark is claimed. The inherited late-wakeup behavior described in §2.7 still retains old geometry/point edits; the current-step contract applies specifically to the new tuning and CCD ID. Single-worker late-wakeup and callback-active awake snapshot continuation are covered, but their combination with parallel late wakeup was not exhaustively tested. No new defect in the local-tuning/CCD-ID/step-stamp changes was reproduced by the expanded checks.
+**Remaining scope limits at this audit:** Windows/Linux had not yet been rebuilt or tested; the subsequent Linux native rebuild is recorded above, while Windows and Linux consumer validation remain pending. No player-feel confirmation or dense-mesh performance benchmark is claimed. The inherited late-wakeup behavior described in §2.7 still retains old geometry/point edits; the current-step contract applies specifically to the new tuning and CCD ID. Single-worker late-wakeup and callback-active awake snapshot continuation are covered, but their combination with parallel late wakeup was not exhaustively tested. No new defect in the local-tuning/CCD-ID/step-stamp changes was reproduced by the expanded checks.
 
 ## 3. Complete native file inventory
 
@@ -365,7 +377,7 @@ These results were obtained during implementation, **not rerun merely to write t
 - Full movement and client-physics suites, client + embedded-server build, and standalone-server build passed.
 - Two final movement runs produced identical logs.
 - Loading the saved old 0.2.0 runtime with the updated movement executable exited with the compatibility error rather than proceeding into physics.
-- Real player feel and updated Windows/Linux binaries remain unverified.
+- Real player feel remains unverified. Windows native rebuilding is pending; the subsequent Linux native rebuild/checks are recorded above, separately from pending Linux server rebuilding/deployment.
 
 Existing application binaries/debug outputs were preserved after validation; rebuilding the game is required to activate the source changes. The matching Mac native library remains in the sibling `JaiBox3D/bin/macos/` directory.
 
