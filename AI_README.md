@@ -2,11 +2,13 @@
 
 Last audited: **2026-10-08**. This is the cumulative record of local native changes, their reasons, and the contracts future AI-assisted changes must preserve. It supplements the API documentation in [docs/simulation.md](docs/simulation.md); it does not describe upstream Box3D features as our work.
 
-> **Review status:** the user explicitly accepts stair-induced ceiling penetration; do not add an upward-clearance sweep or destination-fit veto. The extreme-damping numerical hole is fixed, and the follow-up regressions/validation are recorded in §2.8. Linux x86-64 Box3D has now been rebuilt and tested (details below); Windows native rebuilding, Linux server rebuilding/deployment, and real-player feel remain pending. This allowance is not blanket collision-safety verification.
+> **Review status:** the user explicitly accepts stair-induced ceiling penetration; do not add an upward-clearance sweep or destination-fit veto. Stair/damping validation and the completed Linux native rebuild are historical results for §2.8. **The later ice-contact change in §2.9 is source-only, unbuilt and untested at the user's request on every platform.** ABI remains 0.3.0, but existing macOS/Linux libraries do not contain that change; Windows rebuilding, Linux server rebuilding/deployment, and player feel also remain pending. This allowance is not blanket collision-safety verification.
 
 ## Cross-platform rebuild TODO
 
-**AI handoff, updated 2026-10-08. Linux native rebuild complete; Windows native rebuild pending.** The callback ABI is **0.3.0**; macOS arm64 and Linux x86-64 libraries have been rebuilt. The Linux standalone server was deliberately not recompiled or deployed in the native-only follow-up. Old 0.2.0 libraries must not be paired with the updated bindings or executables.
+**AI handoff, updated 2026-10-08. Linux native rebuild completed for §2.8; later §2.9 ice-contact source changes are not built on any platform.** The callback ABI remains **0.3.0**; existing macOS arm64 and Linux x86-64 libraries contain the stair/damping work but not §2.9. The Linux standalone server was deliberately not recompiled or deployed in the native-only follow-up. Old 0.2.0 libraries must not be paired with the updated bindings or executables.
+
+- [ ] **Latest ice-contact follow-up (§2.9), all platforms:** rebuild/stage macOS arm64, Windows x64, and Linux x86-64 native libraries from the updated source before claiming this behavior is active. The user explicitly requested source inspection/changes without tests or builds for this task; none were run. Do not resume validation just because this TODO exists—respect that request until later authorization. Bindings/public layouts are unchanged, and the 0.3.0 version check cannot distinguish the old and new contact behavior. Record source revisions and package the new runtimes with rebuilt game consumers; Linux remains server-only.
 
 - [ ] **Synchronize sources/artifacts before other-PC work:** bring over the matching workspace, `box3d`, `JaiBox3D`, `FatGoblins`, and `FatGoblinsServer` revisions. The native/binding build-source revisions are recorded below. Synchronize the rebuilt Linux runtime artifact and workspace gitlinks as well; source-only synchronization is insufficient. A pull cannot retrieve unpushed work; commit/push only when the user authorizes it, including updated root gitlinks. This TODO lives in repository documentation, not just local OptMem or ignored `.build/` files.
 - [ ] **Windows x64:** with CMake, the Visual Studio C++ x64 toolchain, and Jai available, run from sibling `JaiBox3D`:
@@ -239,7 +241,7 @@ Confirmed single-precision, 64-bit Jai/C layouts:
 
 The internal contact layout also changes. Snapshot/recording version constants were not changed again in October; the existing snapshot layout hash includes `sizeof(b3Contact)` and `sizeof(b3Manifold)` and rejects incompatible old snapshot images. Do not infer binary snapshot compatibility merely from unchanged format version constants.
 
-As of this audit, **macOS arm64 is rebuilt**. Checked-in Windows/Linux libraries have **not** been rebuilt for this ABI. Their sources/build staging are prepared, but rebuilding and deploying the native library and game/server together is mandatory. Updated game startup rejects incompatible version/precision unconditionally, including production builds; generated compile-time layout assertions alone cannot validate a loaded old library.
+At the original ABI audit, **macOS arm64 was rebuilt** and Windows/Linux were pending. The subsequent Linux native rebuild is recorded above; Windows is still pending. **Neither existing macOS nor Linux artifact contains the later §2.9 source change.** Rebuilding and deploying the native library and game/server together is mandatory. Updated game startup rejects incompatible version/precision unconditionally, including production builds; generated compile-time layout assertions alone cannot validate a loaded old library, and the version check cannot distinguish behavioral changes within 0.3.0.
 
 ### 2.6 New native regressions
 
@@ -323,6 +325,34 @@ This extreme-value weakness already exists through world damping, but the new ov
 
 **Remaining scope limits at this audit:** Windows/Linux had not yet been rebuilt or tested; the subsequent Linux native rebuild is recorded above, while Windows and Linux consumer validation remain pending. No player-feel confirmation or dense-mesh performance benchmark is claimed. The inherited late-wakeup behavior described in §2.7 still retains old geometry/point edits; the current-step contract applies specifically to the new tuning and CCD ID. Single-worker late-wakeup and callback-active awake snapshot continuation are covered, but their combination with parallel late wakeup was not exhaustively tested. No new defect in the local-tuning/CCD-ID/step-stamp changes was reproduced by the expanded checks.
 
+### 2.9 Ice-bridge contact-normal comparison — 2026-10-08, source-only
+
+**Reported problem:** the FrostMage ultimate bridge feels less slippery and its polygon seams more noticeable than under PhysX. The user requested careful source comparison and improvements **without testing or building**. The changes below have not been compiled or run; they are not covered by any earlier passing result in this README.
+
+**Comparison:** the old game reference is `FatGoblins` commit `9adcb36c0e4f8fa2e6378f9026d55fb78881af7e`.
+
+- The bridge material was `0.1` in both backends; Goblins have zero solver friction and both integrations use multiply mixing. Their custom movement braking/acceleration equations and FrostMage casting movement also match. This is not a demonstrated friction-combine regression.
+- Old `SharedPhysicsUtils.jai` implemented `double_sided` by duplicating reversed triangle indices in the same PhysX cook, **not** by setting a query-only flag. The current bridge uses separate front/back cooks because Box3D edge identification expects two triangles per shared edge. Its vertices are already welded and edge identification is already enabled; neither missing welding nor a need to remove backside collision was established.
+- The Goblin is a locked-rotation convex cylinder, not a capsule. Its current 16-sided/32-vertex approximation differs from the old 32-sided cylinder; that existing compromise was not changed here.
+- PhysX PCM `PCMConvexVsMeshContactGeneration::generateTriangleFullContactManifold`, in `GuPCMTriangleContactGen.cpp`, selects the triangle normal when the winning convex-face normal lies within approximately 45 degrees of it, and generates contact geometry consistent with that normal. Box3D previously selected the hull-face normal whenever that face beat the triangle face. Mesh filtering can discard some internal-edge contacts afterward, but it does not perform the same face-normal selection.
+- Box3D's cached hull-face path also lacked the fresh path's existing rejection of strongly opposed contact normals. A face cached as a separating axis could subsequently become a contact without obeying that rule.
+
+**Change, owner `b3CollideTriangleAndHull` in [src/triangle_manifold.c](src/triangle_manifold.c):**
+
+1. Preserve every existing face/edge separating-axis rejection. When the hull face wins against both the triangle face and edge axis, and its outward contact normal is within 45 degrees of the triangle normal, first use the existing triangle-face clipping routine. This produces matching surface-normal contact points, separations, features and cache data; it is not a normal-only overwrite.
+2. If clipping produces no points, retain the original hull-face response. Preserve later edge-contact and GJK fallback logic. Do not remove inactive/concave edge axes, average neighboring normals, or disable CCD.
+3. Keep a cached hull plane's separation early-out, but invalidate/recompute its contact representation when aligned enough to require the new preference or strongly opposed under the existing fresh-contact rule. Other cached hull faces keep the old deep-overlap/separation checks.
+
+**Reason:** normals decide collision response even with zero friction. Prefer the actual surface plane rather than a collider facet in the bounded case where PhysX did so; that should reduce tessellation-dependent response and let sloped ice guide sliding more naturally. This is a source-supported improvement, **not a reproduced diagnosis or proof of restored PhysX feel**.
+
+**Scope and limits:** the routine serves all hull-versus-mesh/heightfield contacts, not just ice/Goblins. Surface-normal selection can change push-out, contact counts, clustering and warm-starting. Existing fallback code is retained, but its outcome may differ after a successful face clip. Aligned hull-face fallback caches can require fresh recomputation on subsequent frames; performance has not been measured. The patch does not implement full PhysX contact generation, cross-shape front/back suppression, altered mesh-filter deferral thresholds, or CCD seam filtering. Real boundaries, concave junctions and high-speed crossings still require later review in motion.
+
+**Related game tuning:** `ice_bridge_create_body` now uses the existing `STATIC_ICE_FRICTION` (`0.05`) for both sides, matching authored level ice instead of its old literal `0.1`. This deliberately halves bridge-surface braking in the custom Goblin movement calculation and slightly lowers its ground-acceleration multiplier (`0.625` → `0.5625`). It is **new tuning**, not restoration of a historical coefficient. `ICE_FRICTION` (`0.1`), the caster's separate multiplier, and the global movement equations are unchanged. Other dynamic objects also see the lower bridge material coefficient.
+
+**Compatibility / lifetime:** no public or private layout changes, new fields, bindings, version bump, allocations, storage/reset changes, or callback/stepping changes. ABI remains **0.3.0**. Deterministic simulation results can differ despite compatible layouts; old recordings/snapshots should not be assumed to reproduce identical trajectories across the change. Existing native artifacts were deliberately left untouched; all platforms need a later rebuild to contain this behavior.
+
+**Validation:** historical/current/native source comparison and manual patch review only. No compiler, test, game, simulation or probe was run. Pending checks are recorded in [VERIFY_LATER.md](../VERIFY_LATER.md): coasting/steering, slopes, seams, boundaries/undersides, nearby walls, casting versus walking, and unrelated hull/mesh collision behavior. Earlier native/Jai/soak passes are not validation of this patch.
+
 ## 3. Complete native file inventory
 
 This table covers every tracked implementation/test/build/API-documentation path changed locally relative to `30c67b5` through the October work. It excludes this maintenance README, its agent instructions, and its navigation link.
@@ -343,6 +373,7 @@ This table covers every tracked implementation/test/build/API-documentation path
 | [src/shape.h](src/shape.h) | Internal TOI candidate callback signature | No additional change |
 | [src/solver.c](src/solver.c) | CCD callback adapter, candidate filtering, null-callback fix | Fresh pair/child contact ID; remove old stamp increment |
 | [src/solver.h](src/solver.h) | No change | Effective contact Hertz in step context; overflow-safe softness calculation |
+| [src/triangle_manifold.c](src/triangle_manifold.c) | No change | §2.9 triangle-face preference and cached hull-face policy; source-only, unbuilt/untested |
 | [src/recording.h](src/recording.h) | Recording 5.0 | No additional change |
 | [src/world_snapshot.c](src/world_snapshot.c) | Snapshot version 3 | Existing layout hash detects new struct sizes; no file edit |
 | [test/test_world.c](test/test_world.c) | Hook/solver/lifecycle/material/CCD regressions | Local tuning, freshness, isolation, overflow, parallel CCD, reuse, and snapshot regressions |
@@ -361,6 +392,7 @@ These are dependencies/consumers, not additional native solver changes:
 - [JaiBox3D/build_linux.sh](../JaiBox3D/build_linux.sh): stages `.so.0.3` / `.so.0.3.0`; the Mac dylib is rebuilt in the sibling binding repository.
 - [PhysicsCharacter.jai](../FatGoblins/src/shared/physics/PhysicsCharacter.jai): game-owned current/ahead downward sweeps with raised forward clearance, full sweep separation, high-wall preservation, approved-support tuning, and triangle-specific CCD reuse. The native library does not know these gameplay rules.
 - [SharedPhysics.jai](../FatGoblins/src/shared/physics/SharedPhysics.jai): unconditional exact-version/single-precision startup check. Global contact tuning remains unchanged.
+- [IceBridgeManager.jai](../FatGoblins/src/shared/abilities/IceBridgeManager.jai): §2.9 uses the existing `STATIC_ICE_FRICTION` for both bridge sides as a deliberate low-drag tuning change; front/back cooking and storage ownership are unchanged. Source-only, unbuilt/untested.
 - [MovementTests.jai](../FatGoblins/tests/MovementTests.jai): per-frame velocity **and displacement** coverage for 72 stair trajectories, moving steps, actual steep ladder geometry, and wall/ceiling/airborne/shared-mesh/next-frame guards. Endpoint-only traversal tests had missed transient braking.
 - [Server main_build.jai](../FatGoblinsServer/main_build.jai), server deployment documentation, and the executable-only update script use the new Linux SONAME and require matching deployment libraries.
 - [VERIFY_LATER.md](../VERIFY_LATER.md): real-player stair/ladder feel remains pending until explicit user confirmation.
@@ -369,7 +401,7 @@ These are dependencies/consumers, not additional native solver changes:
 
 ### Recorded validation of the October implementation
 
-These results were obtained during implementation, **not rerun merely to write this README**:
+These results were obtained during the stair/callback implementation, **not rerun merely to write this README and not applicable to the later unbuilt/untested §2.9 ice-contact changes**:
 
 - Native debug `WorldTest`, `RecordingTest`, and full native unit suite passed.
 - Separate macOS arm64 ASan + UBSan + heavy-validation `WorldTest` and `RecordingTest` passed without sanitizer reports.
@@ -379,7 +411,7 @@ These results were obtained during implementation, **not rerun merely to write t
 - Loading the saved old 0.2.0 runtime with the updated movement executable exited with the compatibility error rather than proceeding into physics.
 - Real player feel remains unverified. Windows native rebuilding is pending; the subsequent Linux native rebuild/checks are recorded above, separately from pending Linux server rebuilding/deployment.
 
-Existing application binaries/debug outputs were preserved after validation; rebuilding the game is required to activate the source changes. The matching Mac native library remains in the sibling `JaiBox3D/bin/macos/` directory.
+Existing application binaries/debug outputs were preserved after the stair validation; rebuilding the game is required to activate those source changes. The stair/damping Mac native library remains in the sibling `JaiBox3D/bin/macos/` directory. It does **not** contain §2.9, which requires a later native rebuild as well.
 
 ### Native commands
 

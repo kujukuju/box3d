@@ -971,6 +971,7 @@ void b3CollideTriangleAndHull( b3LocalManifold* manifold, int capacity, b3Vec3 v
 
 	b3Plane trianglePlane = b3MakePlaneFromPoints( v1, v2, v3 );
 	float linearSlop = B3_LINEAR_SLOP;
+	float cos45Deg = 0.707106781f;
 
 	float offset = b3PlaneSeparation( trianglePlane, hullB->center );
 	if ( cache->type == b3_backsideAxis )
@@ -1086,8 +1087,12 @@ void b3CollideTriangleAndHull( b3LocalManifold* manifold, int capacity, b3Vec3 v
 			// todo confirm
 			bool isDeep = separation < -2.0f * linearSlop;
 
-			// Don't persist deep cache or allow separation to change too much
-			if ( isDeep == false )
+			// A cached separating plane need not be a suitable contact normal. Reconsider
+			// aligned faces for triangle-face clipping, and reject opposed faces as below.
+			float cosNormalAngle = b3Dot( b3Neg( plane.normal ), trianglePlane.normal );
+			bool preferTriangleFace = cosNormalAngle > cos45Deg;
+			bool pushingDown = cosNormalAngle < -0.25f;
+			if ( isDeep == false && preferTriangleFace == false && pushingDown == false )
 			{
 				//  Try to rebuild contact from last features
 				b3SeparatingAxis faceQuery;
@@ -1268,10 +1273,25 @@ void b3CollideTriangleAndHull( b3LocalManifold* manifold, int capacity, b3Vec3 v
 
 	// Don't admit a hull face significantly opposed to the triangle face.
 	// Need a tolerance to avoid ghost collisions.
-	bool pushingDown = b3Dot( faceQueryB.normal, trianglePlane.normal ) < -0.25f;
+	float cosNormalAngle = b3Dot( faceQueryB.normal, trianglePlane.normal );
+	bool pushingDown = cosNormalAngle < -0.25f;
 	if ( faceQueryB.separation >= faceQueryA.separation && pushingDown == false )
 	{
-		clipSeparation = b3CollideHullFace( manifold, capacity, &triangle, hullB, faceQueryB, cache, enableSpeculative );
+		// Like PhysX PCM, prefer the mesh surface normal when the winning hull face
+		// is within 45 degrees. Reclip so points and separation agree with that normal.
+		// Keep the original response if an edge axis wins or the finite face clips away.
+		if ( cosNormalAngle > cos45Deg && faceQueryB.separation >= edgeQuery.separation )
+		{
+			clipSeparation = b3CollideTriangleFace( manifold, capacity, &triangle, hullB, faceQueryA, cache, enableSpeculative );
+			if ( manifold->pointCount == 0 )
+			{
+				clipSeparation = b3CollideHullFace( manifold, capacity, &triangle, hullB, faceQueryB, cache, enableSpeculative );
+			}
+		}
+		else
+		{
+			clipSeparation = b3CollideHullFace( manifold, capacity, &triangle, hullB, faceQueryB, cache, enableSpeculative );
+		}
 	}
 	else
 	{
