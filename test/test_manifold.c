@@ -501,6 +501,119 @@ static int TriangleParallelEdgeTest( void )
 	return 0;
 }
 
+// A tilted box face wins SAT over the horizontal triangle. The forced hull-face query
+// confirms that this fixture would have used the tilted normal before the ice change.
+// Reusing that hull-face cache must reconsider the aligned contact, not return it early.
+static int TriangleHullAlignedFaceTest( void )
+{
+	b3Transform transform = { { 0.0f, 0.644f, 0.0f }, ExactQuat( kAxisZ, B3_PI / 6.0f ) };
+	b3BoxHull hull = b3MakeTransformedBoxHull( 0.5f, 0.5f, 0.5f, transform );
+	b3Vec3 v1 = { -0.125f, 0.0f, -0.05f };
+	b3Vec3 v2 = { -0.11f, 0.0f, 0.05f };
+	b3Vec3 v3 = { -0.095f, 0.0f, -0.05f };
+
+	b3LocalManifoldPoint points[8];
+	b3LocalManifold manifold = { 0 };
+	manifold.points = points;
+	b3SATCache cache = { .type = b3_manualFaceAxisB };
+	b3CollideTriangleAndHull( &manifold, 8, v1, v2, v3, 0, &hull.base, &cache, true );
+
+	ENSURE( manifold.pointCount >= 2 );
+	ENSURE( manifold.feature == b3_featureHullFace );
+	ENSURE( cache.type == b3_faceAxisB );
+	ENSURE( cache.separation < 0.0f && cache.separation > -2.0f * B3_LINEAR_SLOP );
+	ENSURE_SMALL( manifold.normal.x + 0.5f, 1e-5f );
+
+	b3SATCache freshCache = { 0 };
+	b3CollideTriangleAndHull( &manifold, 8, v1, v2, v3, 0, &hull.base, &freshCache, true );
+	ENSURE( manifold.pointCount >= 2 );
+	ENSURE( manifold.feature == b3_featureTriangleFace );
+	ENSURE( freshCache.type == b3_faceAxisA );
+	ENSURE_SMALL( manifold.normal.y - 1.0f, 1e-5f );
+	for ( int i = 0; i < manifold.pointCount; ++i )
+	{
+		ENSURE_SMALL( manifold.points[i].point.y - manifold.points[i].separation, 1e-5f );
+	}
+
+	b3CollideTriangleAndHull( &manifold, 8, v1, v2, v3, 0, &hull.base, &cache, true );
+	ENSURE( cache.hit == 0 );
+	ENSURE( manifold.pointCount >= 2 );
+	ENSURE( manifold.feature == b3_featureTriangleFace );
+	ENSURE( cache.type == b3_faceAxisA );
+	ENSURE_SMALL( manifold.normal.y - 1.0f, 1e-5f );
+
+	return 0;
+}
+
+// Beyond 45 degrees the original hull-face clip remains the response, even when
+// that hull face beats the triangle plane. The triangle lies inside its footprint.
+static int TriangleHullUnalignedFaceTest( void )
+{
+	b3Transform transform = { { 0.0f, 0.46f, 0.0f }, ExactQuat( kAxisZ, B3_PI / 3.0f ) };
+	b3BoxHull hull = b3MakeTransformedBoxHull( 0.5f, 0.5f, 0.5f, transform );
+	b3Vec3 v1 = { 0.24f, 0.0f, -0.05f };
+	b3Vec3 v2 = { 0.26f, 0.0f, 0.05f };
+	b3Vec3 v3 = { 0.28f, 0.0f, -0.05f };
+
+	b3LocalManifoldPoint points[8];
+	b3LocalManifold manifold = { 0 };
+	manifold.points = points;
+	b3SATCache cache = { 0 };
+	b3CollideTriangleAndHull( &manifold, 8, v1, v2, v3, 0, &hull.base, &cache, true );
+
+	ENSURE( manifold.pointCount >= 2 );
+	ENSURE( manifold.feature == b3_featureHullFace );
+	ENSURE( cache.type == b3_faceAxisB );
+	ENSURE_SMALL( manifold.normal.x + 0.8660254f, 1e-5f );
+	ENSURE_SMALL( manifold.normal.y - 0.5f, 1e-5f );
+
+	return 0;
+}
+
+// The lowest hull vertex belongs to the shallow left side of this convex wedge, so
+// the triangle-face clip chooses that face and misses a triangle over the right side.
+// The right hull face is still aligned with the triangle and produces a contact: the
+// aligned preference must fall back to that hull-face clip instead of losing contact.
+static int TriangleHullAlignedFaceFallbackTest( void )
+{
+	b3Vec3 hullPoints[] = {
+		{ -1.0f, -0.12f, -0.5f }, { 0.0f, -0.2f, -0.5f }, { 1.0f, 0.0f, -0.5f },
+		{ -1.0f, 1.0f, -0.5f }, { 1.0f, 1.0f, -0.5f },
+		{ -1.0f, -0.12f, 0.5f }, { 0.0f, -0.2f, 0.5f }, { 1.0f, 0.0f, 0.5f },
+		{ -1.0f, 1.0f, 0.5f }, { 1.0f, 1.0f, 0.5f },
+	};
+	b3HullData* hull = b3CreateHull( hullPoints, ARRAY_COUNT( hullPoints ), ARRAY_COUNT( hullPoints ) );
+	ENSURE( hull != NULL );
+
+	b3Vec3 v1 = { 0.75f, 0.0f, -0.1f };
+	b3Vec3 v2 = { 0.8f, 0.0f, 0.1f };
+	b3Vec3 v3 = { 0.85f, 0.0f, -0.1f };
+	b3LocalManifoldPoint points[8];
+	b3LocalManifold manifold = { 0 };
+	manifold.points = points;
+
+	b3SATCache triangleCache = { .type = b3_manualFaceAxisA };
+	b3CollideTriangleAndHull( &manifold, 8, v1, v2, v3, 0, hull, &triangleCache, true );
+	ENSURE( manifold.pointCount == 0 );
+
+	b3SATCache hullCache = { .type = b3_manualFaceAxisB };
+	b3CollideTriangleAndHull( &manifold, 8, v1, v2, v3, 0, hull, &hullCache, true );
+	ENSURE( manifold.pointCount >= 2 );
+	ENSURE( manifold.feature == b3_featureHullFace );
+	ENSURE( hullCache.type == b3_faceAxisB );
+	ENSURE( b3Dot( manifold.normal, kAxisY ) > 0.9f );
+
+	b3SATCache cache = { 0 };
+	b3CollideTriangleAndHull( &manifold, 8, v1, v2, v3, 0, hull, &cache, true );
+	ENSURE( manifold.pointCount >= 2 );
+	ENSURE( manifold.feature == b3_featureHullFace );
+	ENSURE( cache.type == b3_faceAxisB );
+	ENSURE( b3Dot( manifold.normal, kAxisY ) > 0.9f );
+
+	b3DestroyHull( hull );
+	return 0;
+}
+
 // A crossed ridge pair must land on a four point roof face contact. The clipped face
 // separation can be no deeper than root2 times the vertical overlap.
 static int CheckRoofFaceContact( const b3LocalManifold* manifold, const b3SATCache* cache, float overlap )
@@ -1256,6 +1369,9 @@ int ManifoldTest( void )
 	RUN_SUBTEST( RidgeCrossingTest );
 	RUN_SUBTEST( TriangleEdgeTest );
 	RUN_SUBTEST( TriangleParallelEdgeTest );
+	RUN_SUBTEST( TriangleHullAlignedFaceTest );
+	RUN_SUBTEST( TriangleHullUnalignedFaceTest );
+	RUN_SUBTEST( TriangleHullAlignedFaceFallbackTest );
 	RUN_SUBTEST( EdgeAxisOracleTest );
 	RUN_SUBTEST( EdgeAxisRandomOracleTest );
 	RUN_SUBTEST( HullCapsuleEdgeDeepTest );
